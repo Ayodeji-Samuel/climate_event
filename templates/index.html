@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ANSASphere — Environmental Intelligence Platform</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- ANSASphere styles -->
+  <link rel="stylesheet" href="/static/css/ansasphere.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════
+     BOOT SCREEN
+═══════════════════════════════════════════════════════ -->
+<div id="boot-screen" class="boot-screen">
+  <div class="boot-content">
+    <div class="boot-logo">
+      <svg class="boot-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="2" opacity="0.3"/>
+        <circle cx="32" cy="32" r="20" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+        <path d="M12 32 Q22 18 32 32 Q42 46 52 32" stroke="currentColor" stroke-width="2" fill="none"/>
+        <path d="M12 38 Q22 24 32 38 Q42 52 52 38" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.6"/>
+        <circle cx="32" cy="32" r="4" fill="currentColor"/>
+      </svg>
+      <span class="boot-name">ANSASphere</span>
+    </div>
+    <p class="boot-tagline">Environmental Intelligence Platform</p>
+    <div class="boot-progress-wrap">
+      <div class="boot-progress-bar" id="boot-bar"></div>
+    </div>
+    <p class="boot-status" id="boot-status">Initialising system…</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     DESKTOP
+═══════════════════════════════════════════════════════ -->
+<div id="desktop" class="desktop hidden">
+
+  <!-- Top bar -->
+  <header class="topbar" id="topbar">
+    <div class="topbar-left">
+      <button class="app-launcher-btn" id="app-launcher-btn" title="App Launcher">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M3 5h18M3 12h18M3 19h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <span>ANSASphere</span>
+      </button>
+    </div>
+    <div class="topbar-center" id="topbar-breadcrumb">
+      <span class="topbar-context">Flood Prediction &amp; Environmental Intelligence</span>
+    </div>
+    <div class="topbar-right">
+      <div class="status-pill" id="gee-status-pill" title="GEE Connection">
+        <span class="status-dot" id="gee-dot"></span>
+        <span id="gee-label">GEE</span>
+      </div>
+      <div class="status-pill" id="ai-status-pill" title="AI Agent">
+        <span class="status-dot pulse-dot" id="ai-dot"></span>
+        <span>ANSA</span>
+      </div>
+      <button class="icon-btn" id="notif-btn" title="Notifications">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6 6 0 00-5-5.917V4a1 1 0 10-2 0v1.083A6 6 0 006 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="notif-badge" id="notif-badge" style="display:none">0</span>
+      </button>
+      <div class="clock" id="topbar-clock">--:--</div>
+    </div>
+  </header>
+
+  <!-- Desktop work area -->
+  <main class="work-area" id="work-area">
+
+    <!-- Desktop icons -->
+    <div class="desktop-icons" id="desktop-icons">
+      <div class="desk-icon" data-app="flood-monitor">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none"><path d="M6 36 Q12 24 18 30 Q24 36 30 24 Q36 12 42 18" stroke="currentColor" stroke-width="3" stroke-linecap="round" fill="none"/><path d="M6 42 Q12 30 18 36 Q24 42 30 30 Q36 18 42 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" opacity="0.5"/><circle cx="24" cy="20" r="4" fill="currentColor" opacity="0.8"/></svg>
+        </div>
+        <span>Flood Monitor</span>
+      </div>
+      <div class="desk-icon" data-app="ai-assistant">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="16" stroke="currentColor" stroke-width="2.5"/><circle cx="17" cy="22" r="2.5" fill="currentColor"/><circle cx="31" cy="22" r="2.5" fill="currentColor"/><path d="M17 30 Q24 36 31 30" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" fill="none"/><path d="M24 8 L24 4 M36 12 L39 9 M40 24 L44 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.5"/></svg>
+        </div>
+        <span>AI Assistant</span>
+      </div>
+      <div class="desk-icon" data-app="alert-center">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none"><path d="M24 6 L8 38 L40 38 Z" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" fill="none"/><line x1="24" y1="20" x2="24" y2="28" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><circle cx="24" cy="33" r="1.5" fill="currentColor"/></svg>
+        </div>
+        <span>Alert Center</span>
+      </div>
+      <div class="desk-icon" data-app="data-explorer">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none"><rect x="6" y="36" width="8" height="8" rx="1" fill="currentColor" opacity="0.7"/><rect x="20" y="26" width="8" height="18" rx="1" fill="currentColor" opacity="0.85"/><rect x="34" y="14" width="8" height="30" rx="1" fill="currentColor"/><path d="M10 30 L24 20 L38 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.5"/></svg>
+        </div>
+        <span>Data Explorer</span>
+      </div>
+      <!-- climate-monitor icon -->
+      <div class="desk-icon" data-app="climate-monitor">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none">
+            <circle cx="24" cy="24" r="18" stroke="currentColor" stroke-width="2.5" opacity="0.4"/>
+            <path d="M10 34 Q14 22 18 28 Q22 34 26 20 Q30 8 38 14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+            <circle cx="38" cy="14" r="3" fill="currentColor" opacity="0.7"/>
+          </svg>
+        </div>
+        <span>Climate Monitor</span>
+      </div>
+      <div class="desk-icon" data-app="settings">
+        <div class="desk-icon-img">
+          <svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="7" stroke="currentColor" stroke-width="2.5"/><path d="M24 6v4M24 38v4M6 24h4M38 24h4M10.1 10.1l2.8 2.8M35.1 35.1l2.8 2.8M37.9 10.1l-2.8 2.8M12.9 35.1l-2.8 2.8" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+        </div>
+        <span>Settings</span>
+      </div>
+    </div>
+
+    <!-- ── FLOOD MONITOR WINDOW ─────────────────────────────────── -->
+    <div class="os-window" id="win-flood-monitor" data-app="flood-monitor" style="left:60px;top:60px;width:900px;height:580px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M3 15 Q5 10 7 12 Q10 15 12 9 Q15 3 17 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
+          Flood Monitor
+        </span>
+        <div class="win-toolbar">
+          <select id="flood-region-select" class="win-select">
+            <option value="">Loading regions…</option>
+          </select>
+          <input type="date" id="flood-date-input" class="win-date-input" />
+          <button class="win-action-btn" id="run-flood-btn">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M10 6v4l3 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            Analyze
+          </button>
+        </div>
+      </div>
+      <div class="win-body flood-body">
+        <div class="flood-map-wrap">
+          <div id="flood-map" class="flood-map"></div>
+          <div class="map-legend" id="map-legend">
+            <div class="legend-title">Legend</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#00a8ff"></span>Detected flood</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#0050a0"></span>Permanent water</div>
+          </div>
+          <!-- Map loading overlay -->
+          <div class="map-loading" id="map-loading">
+            <div class="spinner"></div>
+            <span>Running Sentinel-1 analysis…</span>
+          </div>
+        </div>
+        <aside class="flood-sidebar">
+          <div class="info-card" id="risk-card">
+            <div class="info-card-title">Risk Level</div>
+            <div class="risk-badge" id="risk-badge">—</div>
+            <div class="risk-detail" id="risk-detail">Run analysis to view</div>
+          </div>
+          <div class="info-card">
+            <div class="info-card-title">Statistics</div>
+            <div class="stat-row"><span>Flooded area</span><strong id="stat-flooded">—</strong></div>
+            <div class="stat-row"><span>Total area</span><strong id="stat-total">—</strong></div>
+            <div class="stat-row"><span>Flood %</span><strong id="stat-pct">—</strong></div>
+            <div class="stat-row"><span>SAR images</span><strong id="stat-images">—</strong></div>
+            <div class="stat-row"><span>Updated</span><strong id="stat-updated">—</strong></div>
+          </div>
+          <div class="info-card">
+            <div class="info-card-title">Layers</div>
+            <label class="layer-toggle"><input type="checkbox" id="layer-flood" checked /> Flood extent</label>
+            <label class="layer-toggle"><input type="checkbox" id="layer-sar" /> SAR backscatter</label>
+            <label class="layer-toggle"><input type="checkbox" id="layer-water" /> Permanent water</label>
+          </div>
+          <button class="sidebar-action-btn" id="flood-alert-btn" style="display:none">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M10 3L3 17h14L10 3z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><line x1="10" y1="9" x2="10" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="14.5" r="0.8" fill="currentColor"/></svg>
+            Create Alert
+          </button>
+        </aside>
+      </div>
+    </div>
+
+    <!-- ── AI ASSISTANT WINDOW ─────────────────────────────────── -->
+    <div class="os-window hidden" id="win-ai-assistant" data-app="ai-assistant" style="left:140px;top:80px;width:520px;height:620px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/><circle cx="7.5" cy="9" r="1" fill="currentColor"/><circle cx="12.5" cy="9" r="1" fill="currentColor"/><path d="M7 13 Q10 15.5 13 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>
+          ANSA — AI Assistant
+        </span>
+        <div class="win-toolbar">
+          <div class="ai-engine-badge" id="ai-engine-badge">—</div>
+        </div>
+      </div>
+      <div class="win-body ai-body">
+        <div class="chat-messages" id="chat-messages">
+          <!-- Bootstrap message -->
+          <div class="chat-msg assistant">
+            <div class="msg-avatar">A</div>
+            <div class="msg-bubble">
+              <p>Hello! I'm <strong>ANSA</strong>, your environmental intelligence assistant.</p>
+              <p>I can analyze real-time flood data from Sentinel-1 satellite imagery, assess risk levels, and recommend response actions.</p>
+              <p>Try: <em>"What is the flood risk in Nigeria right now?"</em></p>
+            </div>
+          </div>
+        </div>
+        <div class="chat-input-area">
+          <div class="quick-actions" id="quick-actions">
+            <button class="quick-btn" data-msg="Check flood risk in Nigeria">Nigeria</button>
+            <button class="quick-btn" data-msg="Check flood risk in Bangladesh">Bangladesh</button>
+            <button class="quick-btn" data-msg="Show active alerts">Alerts</button>
+            <button class="quick-btn" data-msg="Recommend actions for level 3 flood">Actions</button>
+          </div>
+          <div class="chat-compose">
+            <textarea id="chat-input" class="chat-textarea" placeholder="Ask ANSA anything about floods, risk, or data…" rows="2"></textarea>
+            <button id="chat-send-btn" class="chat-send-btn" title="Send">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M3 10 L17 10 M12 5 L17 10 L12 15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── ALERT CENTER WINDOW ─────────────────────────────────── -->
+    <div class="os-window hidden" id="win-alert-center" data-app="alert-center" style="left:200px;top:90px;width:680px;height:520px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M10 3L3 17h14L10 3z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          Alert Center
+        </span>
+        <div class="win-toolbar">
+          <button class="win-action-btn" id="refresh-alerts-btn">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M4 4 Q10 1 16 7 M16 16 Q10 19 4 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16 7 L16 3 L12 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 13 L4 17 L8 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Refresh
+          </button>
+          <button class="win-action-btn accent" id="new-alert-btn">+ New Alert</button>
+        </div>
+      </div>
+      <div class="win-body alerts-body">
+        <!-- Stats bar -->
+        <div class="alert-stats-bar" id="alert-stats-bar">
+          <div class="alert-stat"><span id="stat-total-alerts">0</span><label>Total Active</label></div>
+          <div class="alert-stat warn"><span id="stat-watch">0</span><label>Watch</label></div>
+          <div class="alert-stat advisory"><span id="stat-advisory">0</span><label>Advisory</label></div>
+          <div class="alert-stat danger"><span id="stat-warning">0</span><label>Warning</label></div>
+          <div class="alert-stat emerg"><span id="stat-emergency">0</span><label>Emergency</label></div>
+        </div>
+        <!-- Alert list -->
+        <div class="alert-list" id="alert-list">
+          <div class="empty-state" id="no-alerts-msg">
+            <svg viewBox="0 0 64 64" fill="none"><circle cx="32" cy="32" r="28" stroke="currentColor" stroke-width="2" opacity="0.3"/><path d="M22 32h20M32 22v20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/></svg>
+            <p>No active alerts</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DATA EXPLORER WINDOW ────────────────────────────────── -->
+    <div class="os-window hidden" id="win-data-explorer" data-app="data-explorer" style="left:180px;top:100px;width:720px;height:540px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><rect x="2" y="14" width="4" height="4" rx="0.5" fill="currentColor" opacity="0.6"/><rect x="8" y="10" width="4" height="8" rx="0.5" fill="currentColor" opacity="0.8"/><rect x="14" y="6" width="4" height="12" rx="0.5" fill="currentColor"/></svg>
+          Data Explorer
+        </span>
+      </div>
+      <div class="win-body data-body">
+        <div class="data-tabs">
+          <button class="data-tab active" data-tab="overview">Overview</button>
+          <button class="data-tab" data-tab="history">History</button>
+          <button class="data-tab" data-tab="regions">Regions</button>
+        </div>
+        <div class="data-content" id="data-content">
+          <div class="data-panel active" id="tab-overview">
+            <div class="data-grid" id="data-overview-grid">
+              <div class="data-metric-card">
+                <div class="dmc-title">GEE Connection</div>
+                <div class="dmc-value" id="de-gee-status">—</div>
+                <div class="dmc-sub">Google Earth Engine</div>
+              </div>
+              <div class="data-metric-card">
+                <div class="dmc-title">Active Alerts</div>
+                <div class="dmc-value" id="de-alerts">—</div>
+                <div class="dmc-sub">Across all regions</div>
+              </div>
+              <div class="data-metric-card">
+                <div class="dmc-title">AI Engine</div>
+                <div class="dmc-value" id="de-ai-engine">—</div>
+                <div class="dmc-sub">Processing model</div>
+              </div>
+              <div class="data-metric-card">
+                <div class="dmc-title">Monitor</div>
+                <div class="dmc-value" id="de-monitor">—</div>
+                <div class="dmc-sub">Background scan</div>
+              </div>
+            </div>
+          </div>
+          <div class="data-panel" id="tab-history">
+            <div class="history-table-wrap">
+              <table class="data-table" id="history-table">
+                <thead><tr><th>Region</th><th>Level</th><th>Message</th><th>Created</th><th>Status</th></tr></thead>
+                <tbody id="history-body"><tr><td colspan="5" class="table-empty">Loading…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="data-panel" id="tab-regions">
+            <div class="regions-grid" id="regions-grid">Loading…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SETTINGS WINDOW ─────────────────────────────────────── -->
+    <div class="os-window hidden" id="win-settings" data-app="settings" style="left:220px;top:80px;width:480px;height:420px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="3" stroke="currentColor" stroke-width="1.8"/><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M14.4 4.2l-1.4 1.4M4.2 14.4l1.4 1.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          Settings
+        </span>
+      </div>
+      <div class="win-body settings-body">
+        <div class="settings-section">
+          <div class="settings-section-title">Earth Engine</div>
+          <div class="settings-row">
+            <label>Project ID</label>
+            <span class="settings-value" id="s-gee-project">—</span>
+          </div>
+          <div class="settings-row">
+            <label>Status</label>
+            <span class="settings-value" id="s-gee-status">—</span>
+          </div>
+          <button class="settings-btn" id="s-gee-reconnect">Reconnect GEE</button>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title">AI Agent</div>
+          <div class="settings-row">
+            <label>Engine</label>
+            <span class="settings-value" id="s-ai-engine">—</span>
+          </div>
+          <div class="settings-row">
+            <label>Monitor</label>
+            <span class="settings-value" id="s-monitor-status">—</span>
+          </div>
+          <div class="settings-row">
+            <label>Last run</label>
+            <span class="settings-value" id="s-last-run">—</span>
+          </div>
+          <div class="settings-btn-row">
+            <button class="settings-btn" id="s-start-monitor">Start Monitor</button>
+            <button class="settings-btn danger" id="s-stop-monitor">Stop Monitor</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title">About ANSASphere</div>
+          <div class="settings-row"><label>Version</label><span class="settings-value">1.0.0</span></div>
+          <div class="settings-row"><label>Data source</label><span class="settings-value">Google Earth Engine</span></div>
+          <div class="settings-row"><label>Satellite</label><span class="settings-value">Sentinel-1 SAR</span></div>
+          <div class="settings-row"><label>Platform</label><span class="settings-value">PythonAnywhere</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── CLIMATE MONITOR WINDOW ───────────────────────────────── -->
+    <div class="os-window hidden" id="win-climate-monitor" data-app="climate-monitor" style="left:80px;top:70px;width:980px;height:620px;">
+      <div class="win-titlebar" data-drag-target>
+        <div class="win-controls">
+          <button class="wc-btn wc-close" data-action="close"></button>
+          <button class="wc-btn wc-min"   data-action="minimize"></button>
+          <button class="wc-btn wc-max"   data-action="maximize"></button>
+        </div>
+        <span class="win-title">
+          <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8" opacity="0.5"/><path d="M4 13 Q7 7 10 10 Q13 13 16 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
+          Climate &amp; Environment Monitor
+        </span>
+        <div class="win-toolbar">
+          <select id="climate-region-select" class="win-select">
+            <option value="nigeria">Nigeria</option>
+            <option value="ghana">Ghana</option>
+            <option value="kenya">Kenya</option>
+            <option value="ethiopia">Ethiopia</option>
+            <option value="mozambique">Mozambique</option>
+            <option value="tanzania">Tanzania</option>
+            <option value="bangladesh">Bangladesh</option>
+            <option value="india">India</option>
+            <option value="pakistan">Pakistan</option>
+            <option value="myanmar">Myanmar</option>
+            <option value="thailand">Thailand</option>
+            <option value="indonesia">Indonesia</option>
+          </select>
+          <input type="date" id="climate-date-input" class="win-date-input" />
+          <button class="win-action-btn" id="run-climate-btn">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M10 6v4l3 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            Analyze
+          </button>
+        </div>
+      </div>
+      <div class="win-body climate-body">
+        <!-- Left: layer selector -->
+        <aside class="climate-sidebar">
+          <div class="climate-section-title">Select Layer</div>
+          <div class="climate-layer-list" id="climate-layer-list">
+            <!-- Populated by climate.js -->
+          </div>
+        </aside>
+        <!-- Center: map -->
+        <div class="climate-map-wrap">
+          <div id="climate-map" class="climate-map"></div>
+          <div class="climate-map-loading" id="climate-map-loading" style="display:none">
+            <div class="spinner"></div>
+            <span id="climate-loading-label">Fetching satellite data…</span>
+          </div>
+          <div class="climate-legend" id="climate-legend" style="display:none">
+            <div class="legend-title" id="climate-legend-title">Legend</div>
+            <div id="climate-legend-scale"></div>
+          </div>
+        </div>
+        <!-- Right: stats panel -->
+        <aside class="climate-stats-panel" id="climate-stats-panel">
+          <div class="climate-section-title" id="climate-active-layer-label">No layer selected</div>
+          <div class="climate-layer-desc" id="climate-layer-desc">Choose a layer from the list and click Analyze.</div>
+          <div class="climate-stats-grid" id="climate-stats-grid"></div>
+          <div class="climate-alert-box" id="climate-alert-box" style="display:none"></div>
+          <div class="climate-dataset-info" id="climate-dataset-info"></div>
+        </aside>
+      </div>
+    </div>
+
+  </main><!-- end .work-area -->
+  <footer class="taskbar" id="taskbar">
+    <div class="taskbar-items" id="taskbar-items">
+      <!-- populated by desktop.js -->
+    </div>
+    <div class="taskbar-system">
+      <div class="system-indicator" id="sys-gee" title="GEE Status">
+        <span class="dot-sm"></span>GEE
+      </div>
+      <div class="system-indicator" id="sys-ai" title="AI Agent">
+        <span class="dot-sm pulse-dot"></span>AI
+      </div>
+    </div>
+  </footer>
+
+  <!-- ── APP LAUNCHER MENU ─────────────────────────────────────── -->
+  <div class="app-launcher" id="app-launcher" style="display:none">
+    <div class="launcher-header">
+      <svg viewBox="0 0 24 24" fill="none" class="launcher-logo"><path d="M3 18 Q6 10 9 14 Q12 18 15 10 Q18 2 21 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+      <span>ANSASphere</span>
+    </div>
+    <div class="launcher-search-wrap">
+      <input type="text" placeholder="Search apps…" class="launcher-search" id="launcher-search" />
+    </div>
+    <div class="launcher-grid" id="launcher-grid">
+      <div class="launcher-item" data-app="flood-monitor">
+        <div class="launcher-icon">🌊</div>
+        <span>Flood Monitor</span>
+      </div>
+      <div class="launcher-item" data-app="ai-assistant">
+        <div class="launcher-icon">🤖</div>
+        <span>AI Assistant</span>
+      </div>
+      <div class="launcher-item" data-app="alert-center">
+        <div class="launcher-icon">⚠️</div>
+        <span>Alert Center</span>
+      </div>
+      <div class="launcher-item" data-app="data-explorer">
+        <div class="launcher-icon">📊</div>
+        <span>Data Explorer</span>
+      </div>
+      <div class="launcher-item" data-app="climate-monitor">
+        <div class="launcher-icon">🌍</div>
+        <span>Climate Monitor</span>
+      </div>
+      <div class="launcher-item" data-app="settings">
+        <div class="launcher-icon">⚙️</div>
+        <span>Settings</span>
+      </div>
+    </div>
+    <div class="launcher-footer">
+      <span>Environmental Intelligence Platform</span>
+    </div>
+  </div>
+
+  <!-- ── NOTIFICATIONS PANEL ────────────────────────────────── -->
+  <div class="notif-panel" id="notif-panel" style="display:none">
+    <div class="notif-panel-header">
+      <span>Notifications</span>
+      <button id="clear-notifs-btn">Clear all</button>
+    </div>
+    <div class="notif-list" id="notif-list">
+      <div class="notif-empty">No notifications</div>
+    </div>
+  </div>
+
+  <!-- ── CREATE ALERT MODAL ─────────────────────────────────── -->
+  <div class="modal-backdrop" id="alert-modal" style="display:none">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Create Flood Alert</h3>
+        <button class="modal-close" id="alert-modal-close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Region</label>
+          <input type="text" id="modal-region" class="form-input" placeholder="e.g. Nigeria — Benue State" />
+        </div>
+        <div class="form-group">
+          <label>Risk Level</label>
+          <select id="modal-level" class="form-input">
+            <option value="1">1 — Watch</option>
+            <option value="2">2 — Advisory</option>
+            <option value="3">3 — Warning</option>
+            <option value="4">4 — Emergency</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Message</label>
+          <textarea id="modal-message" class="form-input" rows="3" placeholder="Describe the flood situation…"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="modal-btn cancel" id="alert-modal-cancel">Cancel</button>
+        <button class="modal-btn submit" id="alert-modal-submit">Create Alert</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
+
+</div><!-- end #desktop -->
+
+<!-- Scripts -->
+<script src="/static/js/desktop.js"></script>
+<script src="/static/js/map_viewer.js"></script>
+<script src="/static/js/ai_agent.js"></script>
+<script src="/static/js/climate.js"></script>
+</body>
+</html>
