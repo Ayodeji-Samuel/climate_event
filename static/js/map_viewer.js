@@ -26,6 +26,12 @@ function initMap() {
     attributionControl: true,
   });
 
+  // Register invalidateMap so desktop.js can call it when the window is revealed
+  if (window.ANSA) window.ANSA.invalidateMap = () => _map?.invalidateSize();
+  else window.addEventListener('load', () => {
+    if (window.ANSA) window.ANSA.invalidateMap = () => _map?.invalidateSize();
+  });
+
   // ── Dark base layer ──────────────────────────────────────────
   L.tileLayer(
     'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -82,17 +88,18 @@ function bindMapControls() {
    REGION BOUNDING BOXES (must match flood_detector.py)
 ══════════════════════════════════════════════════════════════ */
 const REGION_BOUNDS = {
-  nigeria:     [[4.24, 2.68],   [13.89, 14.68]],
-  ghana:       [[4.74, -3.26],  [11.17, 1.19]],
-  kenya:       [[-4.72, 33.91], [4.62, 41.90]],
-  ethiopia:    [[3.40, 32.99],  [14.89, 47.98]],
-  mozambique:  [[-26.86, 30.22],[−10.47, 40.84]],
-  bangladesh:  [[20.67, 88.01], [26.63, 92.67]],
-  india:       [[6.75, 68.16],  [35.50, 97.40]],
-  pakistan:    [[23.69, 60.87], [37.10, 77.84]],
-  myanmar:     [[9.78, 92.19],  [28.53, 101.17]],
-  thailand:    [[5.61, 97.34],  [20.47, 105.64]],
-  indonesia:   [[-10.36, 95.01],[5.48, 141.02]],
+  nigeria:     [[4.24,   2.68],  [13.89,  14.68]],
+  ghana:       [[4.74,  -3.26],  [11.17,   1.19]],
+  kenya:       [[-4.72, 33.91], [ 4.62,  41.90]],
+  ethiopia:    [[3.40,  32.99],  [14.89,  47.98]],
+  mozambique:  [[-26.86, 30.22], [-10.47, 40.84]],
+  tanzania:    [[-11.75, 29.34], [ -0.99, 40.44]],
+  bangladesh:  [[20.67, 88.01],  [26.63,  92.67]],
+  india:       [[6.75,  68.16],  [35.50,  97.40]],
+  pakistan:    [[23.69, 60.87],  [37.10,  77.84]],
+  myanmar:     [[9.78,  92.19],  [28.53, 101.17]],
+  thailand:    [[5.61,  97.34],  [20.47, 105.64]],
+  indonesia:   [[-10.36, 95.01], [ 5.48, 141.02]],
 };
 
 function flyToRegion(regionId) {

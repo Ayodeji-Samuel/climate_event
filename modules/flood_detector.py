@@ -222,27 +222,52 @@ class FloodDetector:
         after_size = after_col.size().getInfo()
 
         logger.info(
-            "S1 images: before=%d (%s→%s), after=%d (%s→%s)",
+            "S1 DESCENDING images: before=%d (%s→%s), after=%d (%s→%s)",
             before_size, before_start, before_end,
             after_size, after_start, after_end,
         )
 
+        # If DESCENDING pass has no data, try ASCENDING pass
         if before_size == 0 or after_size == 0:
-            # Widen search window
+            logger.info("No DESCENDING data — trying ASCENDING pass")
+            asc_before = self.gee.get_s1_collection(
+                aoi, before_start, before_end, pass_direction="ASCENDING"
+            )
+            asc_after = self.gee.get_s1_collection(
+                aoi, after_start, after_end, pass_direction="ASCENDING"
+            )
+            asc_before_sz = asc_before.size().getInfo()
+            asc_after_sz = asc_after.size().getInfo()
+            if asc_before_sz > 0 and asc_after_sz > 0:
+                before_col, after_col = asc_before, asc_after
+                before_size, after_size = asc_before_sz, asc_after_sz
+                logger.info("Using ASCENDING pass: before=%d, after=%d", before_size, after_size)
+
+        if before_size == 0 or after_size == 0:
+            # Widen search window and try both orbit passes
             before_start = (event_dt - timedelta(days=365 + 60)).strftime("%Y-%m-%d")
             before_end = (event_dt - timedelta(days=365 - 60)).strftime("%Y-%m-%d")
             after_start = (event_dt - timedelta(days=15)).strftime("%Y-%m-%d")
             after_end = (event_dt + timedelta(days=15)).strftime("%Y-%m-%d")
-            before_col = self.gee.get_s1_collection(aoi, before_start, before_end)
-            after_col = self.gee.get_s1_collection(aoi, after_start, after_end)
+            before_col = self.gee.get_s1_collection(
+                aoi, before_start, before_end, pass_direction="BOTH"
+            )
+            after_col = self.gee.get_s1_collection(
+                aoi, after_start, after_end, pass_direction="BOTH"
+            )
             before_size = before_col.size().getInfo()
             after_size = after_col.size().getInfo()
+            logger.info(
+                "Widened window (both passes): before=%d, after=%d", before_size, after_size
+            )
 
         if before_size == 0 or after_size == 0:
             return self._no_data_result(region_id, event_date, bbox)
 
         # --- Composites + speckle filter --------------------------------
-        SMOOTH_M = 50   # focal mean radius in metres
+        # 100 m focal-mean (≈10 Sentinel-1 pixels) gives a better SNR
+        # than the original 50 m while preserving flood boundaries.
+        SMOOTH_M = 100   # focal mean radius in metres
         before = before_col.mean().clip(aoi)
         after = after_col.mean().clip(aoi)
         before_sm = before.focal_mean(SMOOTH_M, "circle", "meters")

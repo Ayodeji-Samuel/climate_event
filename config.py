@@ -25,10 +25,13 @@ class Config:
     CACHE_TTL_LONG = 86400      # 24 hr  — historical data
 
     # Alert thresholds (fraction of region flooded)
-    FLOOD_WARN_THRESHOLD = 0.05    # 5 %  → Watch
-    FLOOD_ADV_THRESHOLD = 0.15     # 15 % → Advisory
-    FLOOD_HIGH_THRESHOLD = 0.30    # 30 % → Warning
-    FLOOD_EMERG_THRESHOLD = 0.50   # 50 % → Emergency
+    # Calibrated for country-scale analysis: even large countries have realistic
+    # floods in the 0.1–2 % range.  Original 5–50 % values required country-wide
+    # catastrophes (e.g. 70 000 km² for Nigeria Watch) and would never trigger.
+    FLOOD_WARN_THRESHOLD = 0.001   # 0.1 % → Watch
+    FLOOD_ADV_THRESHOLD = 0.003    # 0.3 % → Advisory
+    FLOOD_HIGH_THRESHOLD = 0.008   # 0.8 % → Warning
+    FLOOD_EMERG_THRESHOLD = 0.015  # 1.5 % → Emergency
 
     # Background scheduler intervals (seconds)
     MONITOR_INTERVAL = 3600    # re-run flood checks every hour

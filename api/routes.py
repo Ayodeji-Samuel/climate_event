@@ -11,6 +11,7 @@ from datetime import datetime
 from flask import (
     Blueprint, current_app, jsonify, request, Response, stream_with_context
 )
+# requests kept for other potential use; geo boundary now uses GEE
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,8 @@ def flood_analyze():
         except ValueError:
             return _err("Invalid bbox format")
 
-    result = _detector().analyze(region_id=region_id, event_date=date, bbox=bbox)
+    use_cache = request.args.get("no_cache", "0") != "1"
+    result = _detector().analyze(region_id=region_id, event_date=date, bbox=bbox, use_cache=use_cache)
     return _ok({"result": result})
 
 
@@ -277,6 +279,111 @@ def event_stream():
 # ---------------------------------------------------------------------------
 # Climate Layers  (15 environmental layers)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Geo Boundary  (GEE-backed – no external HTTP, no GitHub CDN slowness)
+# ---------------------------------------------------------------------------
+# ADM0: FAO/GAUL_SIMPLIFIED_500m/2015/level0  (country polygon, UN names)
+# ADM1: FAO/GAUL_SIMPLIFIED_500m/2015/level1  (province/state polygons)
+
+# ADM0_NAME values in FAO/GAUL_SIMPLIFIED_500m/2015 (UN/FAO standard names)
+_ISO3_TO_GAUL: dict = {
+    "NGA": "Nigeria",
+    "GHA": "Ghana",
+    "KEN": "Kenya",
+    "ETH": "Ethiopia",
+    "MOZ": "Mozambique",
+    "TZA": "United Republic of Tanzania",
+    "BGD": "Bangladesh",
+    "IND": "India",
+    "PAK": "Pakistan",
+    "MMR": "Myanmar",
+    "THA": "Thailand",
+    "IDN": "Indonesia",
+}
+
+_geo_cache: dict = {}   # { "NGA_ADM0": <geojson dict> }
+
+_POLYGON_TYPES = {"Polygon", "MultiPolygon", "GeometryCollection"}
+
+
+def _strip_non_polygon(geom: dict) -> dict:
+    """
+    Recursively remove Point/LineString sub-geometries from a GeometryCollection.
+    Prevents Leaflet from auto-rendering spurious markers for non-polygon parts.
+    """
+    if geom and geom.get("type") == "GeometryCollection":
+        geom["geometries"] = [
+            _strip_non_polygon(g)
+            for g in geom.get("geometries", [])
+            if g.get("type") in _POLYGON_TYPES
+        ]
+    return geom
+
+
+@api_bp.get("/geo/boundary")
+def geo_boundary():
+    """
+    Return a GeoJSON FeatureCollection for a country boundary via GEE.
+    Query params:
+      iso3  – 3-letter ISO country code  (e.g. NGA)
+      level – ADM0 or ADM1               (default: ADM0)
+    Both levels use FAO/GAUL_SIMPLIFIED_500m/2015 (500m-simplified, fast).
+    ADM0 merges all features into a single geometry for the inverse mask.
+    """
+    iso3  = (request.args.get("iso3")  or "").strip().upper()
+    level = (request.args.get("level") or "ADM0").strip().upper()
+
+    if not iso3:
+        return _err("'iso3' is required")
+    if level not in ("ADM0", "ADM1"):
+        return _err("'level' must be ADM0 or ADM1")
+
+    gaul_name = _ISO3_TO_GAUL.get(iso3)
+    if not gaul_name:
+        return _err(f"Unsupported country: {iso3}", 400)
+
+    cache_key = f"{iso3}_{level}"
+    if cache_key in _geo_cache:
+        return jsonify(_geo_cache[cache_key])
+
+    try:
+        gee_engine = current_app.gee
+        if not gee_engine.is_connected:
+            return _err("GEE not connected", 503)
+        ee = gee_engine._ee
+
+        gaul_level = "level0" if level == "ADM0" else "level1"
+        dataset = f"FAO/GAUL_SIMPLIFIED_500m/2015/{gaul_level}"
+
+        if level == "ADM0":
+            # Merge all country features (mainland + islands) into one geometry
+            geom = (ee.FeatureCollection(dataset)
+                      .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
+                      .geometry())
+            fc = ee.FeatureCollection([ee.Feature(geom, {"iso3": iso3, "name": gaul_name})])
+        else:
+            fc = (ee.FeatureCollection(dataset)
+                    .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
+                    .select(["ADM0_NAME", "ADM1_NAME"]))
+
+        geojson = fc.getInfo()
+        if not geojson.get("features"):
+            return _err(f"No boundary data found for {iso3}/{level}", 404)
+
+        # Strip Point/LineString sub-geometries so Leaflet doesn't render markers
+        for feat in geojson.get("features", []):
+            if feat.get("geometry"):
+                _strip_non_polygon(feat["geometry"])
+
+        _geo_cache[cache_key] = geojson
+        return jsonify(geojson)
+
+    except Exception as exc:
+        logger.warning("geo_boundary error for %s/%s: %s", iso3, level, exc)
+        return _err(f"Failed to fetch boundary: {exc}", 502)
+
 
 @api_bp.get("/climate/layers")
 def climate_layers():

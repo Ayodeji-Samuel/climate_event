@@ -110,6 +110,11 @@ function openApp(appId) {
   }
   focusWindow(win, appId);
   updateTaskbar();
+
+  // Leaflet requires invalidateSize() after its container becomes visible
+  if (appId === 'flood-monitor') {
+    setTimeout(() => window.ANSA?.invalidateMap?.(), 120);
+  }
 }
 
 function closeApp(appId) {

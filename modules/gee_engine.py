@@ -160,17 +160,23 @@ class GEEEngine:
     def get_s1_collection(self, aoi, start_date: str, end_date: str,
                           polarization: str = "VV",
                           pass_direction: str = "DESCENDING"):
-        """Return a filtered Sentinel-1 GRD ImageCollection."""
+        """Return a filtered Sentinel-1 GRD ImageCollection.
+
+        pass_direction can be "DESCENDING", "ASCENDING", or "BOTH".
+        "BOTH" merges imagery from both orbits for maximum coverage.
+        """
         ee = self._ee
-        return (
+        col = (
             ee.ImageCollection("COPERNICUS/S1_GRD")
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", polarization))
-            .filter(ee.Filter.eq("orbitProperties_pass", pass_direction))
             .filterBounds(aoi)
             .filterDate(start_date, end_date)
             .select(polarization)
         )
+        if pass_direction != "BOTH":
+            col = col.filter(ee.Filter.eq("orbitProperties_pass", pass_direction))
+        return col
 
     def get_s2_collection(self, aoi, start_date: str, end_date: str,
                           cloud_pct: int = 20):
