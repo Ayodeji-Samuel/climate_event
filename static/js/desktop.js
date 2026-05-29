@@ -115,6 +115,9 @@ function openApp(appId) {
   if (appId === 'flood-monitor') {
     setTimeout(() => window.ANSA?.invalidateMap?.(), 120);
   }
+  if (appId === 'climate-monitor') {
+    setTimeout(() => window.ANSA?.onClimateOpen?.(), 120);
+  }
 }
 
 function closeApp(appId) {

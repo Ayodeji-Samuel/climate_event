@@ -96,6 +96,7 @@ const _cs = {
   tileLayer:     null,
   maskLayer:     null,   // inverse-mask polygon (world minus country)
   statesLayer:   null,   // ADM1 state/region outlines
+  labelsLayer:   null,   // ADM1 state name labels
   countryLayer:  null,   // ADM0 country outline
   selectedLayer: null,
   currentRegion: null,   // which country boundaries are currently loaded
@@ -110,6 +111,11 @@ const _geoCache = {};
    INIT  (called once after desktop is ready)
 ══════════════════════════════════════════════════════════════ */
 function initClimateMonitor() {
+  if (_cs.map) {
+    // Window re-opened: Leaflet must recalculate its container size
+    _cs.map.invalidateSize();
+    return;
+  }
   _buildLayerList();
   _initClimateMap();
   _bindControls();
@@ -154,8 +160,12 @@ function _buildLayerList() {
     container.querySelectorAll('.climate-layer-item').forEach(el => el.classList.remove('active'));
     item.classList.add('active');
     _cs.selectedLayer = item.dataset.layer;
-    _updateActiveLayerInfo(_cs.selectedLayer);
-  });
+    _updateActiveLayerInfo(_cs.selectedLayer);    // Reset trend state when a different layer is selected
+    const canvas = document.getElementById('climate-trend-canvas');
+    if (canvas) canvas.dataset.loadedKey = '';
+    const trendBtn = document.getElementById('climate-trend-btn');
+    if (trendBtn) trendBtn.style.display = 'none';
+    toggleTrendPanel(true);  });
 }
 
 function _updateActiveLayerInfo(layerId) {
@@ -189,9 +199,12 @@ function _initClimateMap() {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   CONTROLS
+   CONTROLS  (bound once — guard prevents duplicate listeners)
 ══════════════════════════════════════════════════════════════ */
+let _controlsBound = false;
 function _bindControls() {
+  if (_controlsBound) return;
+  _controlsBound = true;
   const btn = document.getElementById('run-climate-btn');
   if (btn) btn.addEventListener('click', runClimateAnalysis);
 
@@ -240,9 +253,12 @@ async function _loadCountryBoundary(regionId) {
         fetch(`${BASE}/${iso3}/ADM1/`).then(r => r.json()),
       ]);
 
-      // Prefer simplified GeoJSON for performance
-      const url0 = m0.simplifiedGeojsonURL || m0.gjDownloadURL;
-      const url1 = m1.simplifiedGeojsonURL || m1.gjDownloadURL;
+      // Prefer simplified GeoJSON for performance.
+      // Download GeoJSON through our Flask proxy so the browser avoids GitHub
+      // CORS restrictions and Git-LFS pointer redirects.
+      const _proxyUrl = u => `/api/proxy/boundary?url=${encodeURIComponent(u)}`;
+      const url0 = _proxyUrl(m0.simplifiedGeojsonURL || m0.gjDownloadURL);
+      const url1 = _proxyUrl(m1.simplifiedGeojsonURL || m1.gjDownloadURL);
 
       const [adm0, adm1] = await Promise.all([
         fetch(url0).then(r => r.json()),
@@ -266,6 +282,7 @@ async function _loadCountryBoundary(regionId) {
 function _clearBoundaries() {
   if (_cs.maskLayer)    { _cs.map.removeLayer(_cs.maskLayer);    _cs.maskLayer    = null; }
   if (_cs.statesLayer)  { _cs.map.removeLayer(_cs.statesLayer);  _cs.statesLayer  = null; }
+  if (_cs.labelsLayer)  { _cs.map.removeLayer(_cs.labelsLayer);  _cs.labelsLayer  = null; }
   if (_cs.countryLayer) { _cs.map.removeLayer(_cs.countryLayer); _cs.countryLayer = null; }
 }
 
@@ -309,7 +326,33 @@ function _applyBoundaries(regionId, { adm0, adm1 }) {
     },
     interactive: false,
   }).addTo(_cs.map);
-
+  // 2b ── State name labels at centroid of each ADM1 polygon ────────────
+  const _labelMarkers = [];
+  (adm1.features || []).forEach(feat => {
+    const name = feat.properties?.shapeName
+               || feat.properties?.NAME_1
+               || feat.properties?.name
+               || feat.properties?.ADM1_EN
+               || '';
+    if (!name) return;
+    try {
+      const bounds = L.geoJSON(feat).getBounds();
+      if (!bounds.isValid()) return;
+      _labelMarkers.push(L.marker(bounds.getCenter(), {
+        icon: L.divIcon({
+          className: 'state-label',
+          html: `<span>${name}</span>`,
+          iconSize: [1, 1],
+          iconAnchor: [0, 0],
+        }),
+        interactive: false,
+        keyboard: false,
+      }));
+    } catch (_) {}
+  });
+  if (_labelMarkers.length) {
+    _cs.labelsLayer = L.layerGroup(_labelMarkers).addTo(_cs.map);
+  }
   // 3 ── Country outer boundary (ADM0) ─── bright, solid ──────
   _cs.countryLayer = L.geoJSON(adm0, {
     style: {
@@ -405,6 +448,11 @@ async function runClimateAnalysis() {
       return;
     }
 
+    // Record the active region synchronously so the trend panel can read it
+    // immediately — _applyBoundaries sets it too, but that runs async (after
+    // the GeoJSON download) and can still be null when the user opens the panel.
+    _cs.currentRegion = regionId;
+
     // Add tile layer to map
     if (result.tile_url) {
       _addTileLayer(result.tile_url, regionId);
@@ -414,6 +462,10 @@ async function runClimateAnalysis() {
     _showLegend(_cs.selectedLayer);
     _checkAlerts(result);
     _showDatasetInfo(result.meta);
+
+    // Reveal trend button now that we have a successful analysis
+    const trendBtn = document.getElementById('climate-trend-btn');
+    if (trendBtn) trendBtn.style.display = '';
 
   } catch (err) {
     _climateToast(`Error: ${err.message}`, 'error');
@@ -459,6 +511,9 @@ function _bringBoundariesToFront() {
   if (_cs.maskLayer)    _cs.maskLayer.bringToFront();
   if (_cs.statesLayer)  _cs.statesLayer.bringToFront();
   if (_cs.countryLayer) _cs.countryLayer.bringToFront();
+  // _cs.labelsLayer is L.layerGroup of L.Marker (divIcon) — markers live in
+  // Leaflet's markerPane (z-index 600) which is always above the overlayPane
+  // (z-index 400), so no bringToFront() call is needed or available.
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -496,6 +551,12 @@ function _clearStats() {
   if (grid) grid.innerHTML = '';
   const info = document.getElementById('climate-dataset-info');
   if (info) info.textContent = '';
+  // Hide trend btn and close chart panel on every new analysis start
+  const trendBtn = document.getElementById('climate-trend-btn');
+  if (trendBtn) trendBtn.style.display = 'none';
+  toggleTrendPanel(true);
+  const canvas = document.getElementById('climate-trend-canvas');
+  if (canvas) canvas.dataset.loadedKey = '';
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -585,28 +646,261 @@ function _climateToast(msg, type) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   HOOK into desktop ready
+   DESKTOP INTEGRATION
+   desktop.js calls window.ANSA.onClimateOpen() whenever the
+   Climate Monitor window is shown (first open AND re-opens).
+   initClimateMonitor handles both cases:
+     - first open  → full init (map, controls, layer list)
+     - re-open     → invalidateSize() so Leaflet redraws tiles
 ══════════════════════════════════════════════════════════════ */
-// Wait for desktop.js to fire, then init
 document.addEventListener('DOMContentLoaded', () => {
-  // Init map lazily when the window is first opened
-  const winEl = document.getElementById('win-climate-monitor');
-  if (!winEl) return;
-
-  const observer = new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      if (m.type === 'attributes' && m.attributeName === 'class') {
-        if (!winEl.classList.contains('hidden') && !_cs.map) {
-          // Small delay lets the DOM finish showing the window
-          setTimeout(initClimateMonitor, 80);
-        }
-      }
-    }
-  });
-  observer.observe(winEl, { attributes: true });
-
-  // Also init immediately if already open (unlikely at load but safe)
-  if (!winEl.classList.contains('hidden')) {
-    setTimeout(initClimateMonitor, 80);
-  }
+  window.ANSA = window.ANSA || {};
+  window.ANSA.onClimateOpen = initClimateMonitor;
 });
+
+/* ══════════════════════════════════════════════════════════════
+   TREND CHART PANEL
+   Uses Chart.js (loaded via CDN in index.html).
+   Shows a 12-month time series for the selected layer plus 2
+   correlated parameters, with Pearson r badges and an insight.
+══════════════════════════════════════════════════════════════ */
+
+let _trendChart = null;   // Chart.js instance — destroyed/re-created on each load
+
+/**
+ * Toggle the slide-up chart panel.
+ * Pass `true` to force-close regardless of current state.
+ */
+function toggleTrendPanel(forceClose) {
+  const panel = document.getElementById('climate-chart-panel');
+  const btn   = document.getElementById('climate-trend-btn');
+  if (!panel) return;
+
+  const isOpen = panel.classList.contains('open');
+  if (forceClose === true || (forceClose !== false && isOpen)) {
+    panel.classList.remove('open');
+    if (btn) btn.textContent = '📈 Show Trend Analysis';
+    return;
+  }
+
+  panel.classList.add('open');
+  if (btn) btn.textContent = '📉 Hide Trend Analysis';
+
+  // Wait for the CSS height transition (~350 ms) before rendering the chart,
+  // otherwise the canvas has 0 height and Chart.js draws nothing.
+  setTimeout(() => _ensureTrendLoaded(), 380);
+}
+
+/** Load trend data only if not already loaded for this layer+region combo. */
+function _ensureTrendLoaded() {
+  const regionId = _cs.currentRegion
+    || (document.getElementById('climate-region-select') || {}).value
+    || '';
+  if (!_cs.selectedLayer || !regionId) return;
+  const canvas = document.getElementById('climate-trend-canvas');
+  if (!canvas) return;
+  const key = `${_cs.selectedLayer}:${regionId}`;
+  if (canvas.dataset.loadedKey === key) return;   // already rendered
+
+  const date = (document.getElementById('climate-date-input') || {}).value || '';
+  _loadTrend(_cs.selectedLayer, regionId, date);
+}
+
+/** Fetch `/api/climate/trend` and render the chart. */
+async function _loadTrend(layerId, regionId, date) {
+  const loading = document.getElementById('ccp-loading');
+  if (loading) loading.style.display = 'flex';
+
+  try {
+    const params = new URLSearchParams({ layer_id: layerId, region_id: regionId });
+    if (date) params.set('date', date);
+
+    const res  = await fetch(`/api/climate/trend?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const data = json.result || {};
+
+    if (!data.success) {
+      _renderTrendError(data.message || 'Trend data not available for this layer.');
+      return;
+    }
+    _renderTrendChart(data);
+
+    // Mark as loaded so we skip re-fetch on re-open
+    const canvas = document.getElementById('climate-trend-canvas');
+    if (canvas) canvas.dataset.loadedKey = `${layerId}:${regionId}`;
+
+  } catch (err) {
+    _renderTrendError(`Could not load trend: ${err.message}`);
+  } finally {
+    if (loading) loading.style.display = 'none';
+  }
+}
+
+/** Show an error message inside the chart panel. */
+function _renderTrendError(msg) {
+  const insightEl = document.getElementById('ccp-insight');
+  if (insightEl) insightEl.textContent = msg;
+  const corrEl = document.getElementById('ccp-correlations');
+  if (corrEl) corrEl.innerHTML = '';
+  const tabTitle = document.getElementById('ccp-tab-title');
+  if (tabTitle) tabTitle.textContent = '📈 Trend Analysis';
+}
+
+/** Render the Chart.js multi-line chart from the API result object. */
+function _renderTrendChart(data) {
+  if (typeof Chart === 'undefined') {
+    _renderTrendError('Chart.js library not loaded — check your network connection.');
+    return;
+  }
+
+  const canvas = document.getElementById('climate-trend-canvas');
+  if (!canvas) return;
+
+  // Destroy previous instance to avoid memory leaks
+  if (_trendChart) { _trendChart.destroy(); _trendChart = null; }
+
+  const primary    = data.primary    || {};
+  const correlates = data.correlates || [];
+  const labels     = (primary.series || []).map(p => p.month);
+
+  const PALETTE = { primary: '#00d4b8', c0: '#00a8ff', c1: '#ffbe3d' };
+
+  const datasets = [
+    {
+      label:            `${primary.label} (${primary.unit})`,
+      data:             (primary.series || []).map(p => p.value),
+      borderColor:      PALETTE.primary,
+      backgroundColor:  'rgba(0,212,184,.09)',
+      borderWidth:      2,
+      pointRadius:      3,
+      pointHoverRadius: 5,
+      tension:          0.35,
+      fill:             true,
+      yAxisID:          'y',
+      spanGaps:         true,
+    },
+  ];
+
+  if (correlates[0]) {
+    datasets.push({
+      label:           `${correlates[0].label} (${correlates[0].unit})`,
+      data:            (correlates[0].series || []).map(p => p.value),
+      borderColor:     PALETTE.c0,
+      backgroundColor: 'transparent',
+      borderWidth:     1.5,
+      borderDash:      [6, 3],
+      pointRadius:     2,
+      tension:         0.35,
+      fill:            false,
+      yAxisID:         'y1',
+      spanGaps:        true,
+    });
+  }
+  if (correlates[1]) {
+    datasets.push({
+      label:           `${correlates[1].label} (${correlates[1].unit})`,
+      data:            (correlates[1].series || []).map(p => p.value),
+      borderColor:     PALETTE.c1,
+      backgroundColor: 'transparent',
+      borderWidth:     1.5,
+      borderDash:      [3, 3],
+      pointRadius:     2,
+      tension:         0.35,
+      fill:            false,
+      yAxisID:         'y1',
+      spanGaps:        true,
+    });
+  }
+
+  _trendChart = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive:           true,
+      maintainAspectRatio:  false,
+      interaction:          { mode: 'index', intersect: false },
+      animation:            { duration: 400 },
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: {
+            color:    '#a8c4e0',
+            boxWidth: 14,
+            font:     { size: 10 },
+            padding:  10,
+          },
+        },
+        tooltip: {
+          backgroundColor: 'rgba(7,21,37,.96)',
+          titleColor:      '#e8f2ff',
+          bodyColor:       '#a8c4e0',
+          borderColor:     'rgba(0,168,255,.2)',
+          borderWidth:     1,
+          padding:         8,
+        },
+      },
+      scales: {
+        x: {
+          grid:  { color: 'rgba(255,255,255,.04)' },
+          ticks: { color: '#5a7a9a', font: { size: 10 }, maxTicksLimit: 12 },
+        },
+        y: {
+          position: 'left',
+          grid:     { color: 'rgba(255,255,255,.05)' },
+          ticks:    { color: PALETTE.primary, font: { size: 10 } },
+          title: {
+            display: true,
+            text:    primary.unit || '',
+            color:   PALETTE.primary,
+            font:    { size: 10 },
+          },
+        },
+        y1: {
+          position: 'right',
+          grid:     { drawOnChartArea: false },
+          ticks:    { color: PALETTE.c0, font: { size: 10 } },
+          title: {
+            display: correlates.length > 0,
+            text:    correlates[0] ? correlates[0].unit : '',
+            color:   PALETTE.c0,
+            font:    { size: 10 },
+          },
+        },
+      },
+    },
+  });
+
+  // ── Tab title ────────────────────────────────────────────────
+  const tabTitle = document.getElementById('ccp-tab-title');
+  if (tabTitle) {
+    tabTitle.textContent =
+      `📈 ${primary.label} — ${data.months || 12}-Month Trend · ${data.region_label || ''}`;
+  }
+
+  // ── Correlation badges ───────────────────────────────────────
+  const corrEl = document.getElementById('ccp-correlations');
+  if (corrEl) {
+    if (correlates.length === 0) {
+      corrEl.innerHTML = '<div style="font-size:10px;color:var(--text-2)">No correlation data.</div>';
+    } else {
+      corrEl.innerHTML = correlates.map((c, i) => {
+        const r   = c.correlation;
+        const rFmt = (r !== null && r !== undefined) ? r.toFixed(2) : null;
+        const cls  = !rFmt ? 'na' : (r >= 0 ? 'pos' : 'neg');
+        const rTxt = rFmt ? `r=${rFmt}` : 'r=N/A';
+        const col  = i === 0 ? PALETTE.c0 : PALETTE.c1;
+        return `<div class="corr-badge" title="${c.description || ''}">
+          <div class="corr-dot" style="background:${col}"></div>
+          <span class="corr-label">${c.label}</span>
+          <span class="corr-r ${cls}">${rTxt}</span>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  // ── Insight text ─────────────────────────────────────────────
+  const insightEl = document.getElementById('ccp-insight');
+  if (insightEl) insightEl.textContent = data.insight || '';
+}
+

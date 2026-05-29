@@ -428,16 +428,39 @@
             <!-- Populated by climate.js -->
           </div>
         </aside>
-        <!-- Center: map -->
-        <div class="climate-map-wrap">
-          <div id="climate-map" class="climate-map"></div>
-          <div class="climate-map-loading" id="climate-map-loading" style="display:none">
-            <div class="spinner"></div>
-            <span id="climate-loading-label">Fetching satellite data…</span>
+        <!-- Center: map + collapsible chart panel -->
+        <div class="climate-center-col">
+          <div class="climate-map-wrap">
+            <div id="climate-map" class="climate-map"></div>
+            <div class="climate-map-loading" id="climate-map-loading" style="display:none">
+              <div class="spinner"></div>
+              <span id="climate-loading-label">Fetching satellite data…</span>
+            </div>
+            <div class="climate-legend" id="climate-legend" style="display:none">
+              <div class="legend-title" id="climate-legend-title">Legend</div>
+              <div id="climate-legend-scale"></div>
+            </div>
           </div>
-          <div class="climate-legend" id="climate-legend" style="display:none">
-            <div class="legend-title" id="climate-legend-title">Legend</div>
-            <div id="climate-legend-scale"></div>
+
+          <!-- ── Trend / chart panel (slides up from bottom) ── -->
+          <div class="climate-chart-panel" id="climate-chart-panel">
+            <div class="ccp-header">
+              <span class="ccp-tab-title" id="ccp-tab-title">📈 Trend Analysis</span>
+              <button class="ccp-close-btn" id="ccp-close-btn" onclick="toggleTrendPanel(true)" title="Close chart">✕</button>
+            </div>
+            <div class="ccp-body">
+              <div class="ccp-chart-wrap">
+                <canvas id="climate-trend-canvas"></canvas>
+              </div>
+              <div class="ccp-meta">
+                <div class="ccp-correlations" id="ccp-correlations"></div>
+                <div class="ccp-insight" id="ccp-insight"></div>
+              </div>
+            </div>
+            <div class="ccp-loading" id="ccp-loading" style="display:none">
+              <div class="spinner"></div>
+              <span>Computing trend data from GEE…</span>
+            </div>
           </div>
         </div>
         <!-- Right: stats panel -->
@@ -447,6 +470,9 @@
           <div class="climate-stats-grid" id="climate-stats-grid"></div>
           <div class="climate-alert-box" id="climate-alert-box" style="display:none"></div>
           <div class="climate-dataset-info" id="climate-dataset-info"></div>
+          <button class="ccp-toggle-btn" id="climate-trend-btn" style="display:none" onclick="toggleTrendPanel()">
+            📈 Show Trend Analysis
+          </button>
         </aside>
       </div>
     </div>
@@ -556,6 +582,7 @@
 </div><!-- end #desktop -->
 
 <!-- Scripts -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script src="/static/js/desktop.js"></script>
 <script src="/static/js/map_viewer.js"></script>
 <script src="/static/js/ai_agent.js"></script>

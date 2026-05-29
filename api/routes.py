@@ -7,11 +7,12 @@ Module instances are retrieved from Flask's current_app.
 import json
 import logging
 import time
+import urllib.request
 from datetime import datetime
+from urllib.parse import urlparse
 from flask import (
     Blueprint, current_app, jsonify, request, Response, stream_with_context
 )
-# requests kept for other potential use; geo boundary now uses GEE
 
 logger = logging.getLogger(__name__)
 
@@ -484,3 +485,77 @@ def climate_cache_stats():
         "compressed_bytes": cache.size,
         "compressed_kb": round(cache.size / 1024, 2),
     })
+
+
+# Hosts whose GeoJSON download URLs are trusted for the boundary proxy.
+_ALLOWED_BOUNDARY_HOSTS = frozenset({
+    "www.geoboundaries.org",
+    "github.com",
+    "raw.githubusercontent.com",
+    "cdn.geoboundaries.org",
+})
+
+
+@api_bp.get("/proxy/boundary")
+def proxy_boundary():
+    """
+    Proxies GeoJSON boundary file downloads server-side to avoid the browser
+    hitting GitHub's CORS restrictions (and Git-LFS pointer redirects).
+    Only URLs whose hostname is in _ALLOWED_BOUNDARY_HOSTS are forwarded.
+    """
+    url = request.args.get("url", "").strip()
+    if not url:
+        return _err("'url' param required"), 400
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in _ALLOWED_BOUNDARY_HOSTS:
+        return _err("Untrusted or invalid URL"), 403
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ANSASphere/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        return jsonify(data)
+    except Exception as exc:
+        logger.warning("proxy_boundary failed for %s: %s", url, exc)
+        return _err("Failed to fetch boundary"), 502
+
+
+@api_bp.get("/climate/trend")
+def climate_trend():
+    """
+    Compute a 12-month time series + 2 correlated layer series for a layer.
+
+    Query params:
+      layer_id   – one of the 15 layer IDs  (required)
+      region_id  – known region ID          (default: nigeria)
+      date       – ISO date YYYY-MM-DD      (default: today)
+      months     – number of months         (default: 12, range: 3–24)
+
+    Returns:
+      { result: { success, primary: {label, unit, series},
+                  correlates: [{id, label, unit, series, correlation, description}],
+                  insight: str } }
+    """
+    layer_id  = request.args.get("layer_id", "").strip()
+    region_id = request.args.get("region_id", "nigeria").strip()
+    date      = request.args.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
+    months    = request.args.get("months", "12")
+
+    if not layer_id:
+        return _err("'layer_id' is required.")
+
+    try:
+        months = max(3, min(24, int(months)))
+    except (TypeError, ValueError):
+        months = 12
+
+    if not _gee().is_connected:
+        return _ok({"result": {"success": False, "message": "GEE not connected"}})
+
+    result = _climate().get_trend(
+        layer_id=layer_id,
+        region_id=region_id,
+        date=date,
+        months=months,
+    )
+    return _ok({"result": result})
+
