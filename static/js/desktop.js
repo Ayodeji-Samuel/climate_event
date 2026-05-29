@@ -429,51 +429,60 @@ function showToast(title, message, type = 'info') {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   SSE — SERVER-SENT EVENTS
+   STATUS POLLING  (replaces SSE for PythonAnywhere compatibility)
+   PythonAnywhere's Apache/mod_wsgi does not support long-lived SSE
+   connections: time.sleep(30) in the generator blocks a worker
+   thread, starving all other requests.  Regular polling against
+   /api/health is reliable and requires no persistent connection.
 ══════════════════════════════════════════════════════════════ */
-let _sseSource = null;
+let _pollTimer      = null;
+let _lastAlertCount = -1;
 
+/* connectSSE() name kept so existing call-sites need no changes. */
 function connectSSE() {
-  if (_sseSource) _sseSource.close();
-  _sseSource = new EventSource('/api/events/stream');
-
-  _sseSource.onmessage = e => {
-    try {
-      const data = JSON.parse(e.data);
-      handleSSEEvent(data);
-    } catch {}
-  };
-
-  _sseSource.onerror = () => {
-    updateGEEStatusUI(false);
-    setTimeout(connectSSE, 15000);   // reconnect after 15 s
-  };
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollStatus();                         // immediate first poll
+  _pollTimer = setInterval(_pollStatus, 30000);
 }
 
-function handleSSEEvent(data) {
-  if (data.type === 'heartbeat') {
-    updateGEEStatusUI(data.gee_connected);
-    // Update notification badge from active alerts
-    const badge = document.getElementById('notif-badge');
-    if (data.active_alerts > 0) {
-      badge.textContent = data.active_alerts;
-      badge.style.display = 'flex';
-    }
-    // Update taskbar GEE indicator
-    const dot = document.querySelector('#sys-gee .dot-sm');
-    if (dot) dot.classList.toggle('online', data.gee_connected);
-  }
+async function _pollStatus() {
+  try {
+    const res = await fetch('/api/health');
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
 
-  if (data.type === 'alerts_update' && data.count > 0) {
-    addNotification(
-      `${data.count} Active Alert${data.count !== 1 ? 's' : ''}`,
-      `${data.alerts[0]?.region || ''}: ${data.alerts[0]?.label || ''}`,
-      'warning'
-    );
-    // Refresh alert center if open
-    if (!document.getElementById('win-alert-center').classList.contains('hidden')) {
-      loadAlerts();
+    // GEE status
+    const connected = data.gee?.connected ?? false;
+    updateGEEStatusUI(connected);
+    const dot = document.querySelector('#sys-gee .dot-sm');
+    if (dot) dot.classList.toggle('online', connected);
+
+    // Alert badge
+    const alertCount = data.alerts?.active ?? 0;
+    const badge = document.getElementById('notif-badge');
+    if (badge) {
+      if (alertCount > 0) {
+        badge.textContent = alertCount;
+        badge.style.display = 'flex';
+      } else {
+        badge.style.display = 'none';
+      }
     }
+
+    // Notify + refresh alert center when count rises
+    if (_lastAlertCount !== -1 && alertCount > _lastAlertCount) {
+      addNotification(
+        `${alertCount} Active Alert${alertCount !== 1 ? 's' : ''}`,
+        'New environmental alert detected',
+        'warning'
+      );
+      if (!document.getElementById('win-alert-center')?.classList.contains('hidden')) {
+        loadAlerts();
+      }
+    }
+    _lastAlertCount = alertCount;
+  } catch {
+    updateGEEStatusUI(false);
   }
 }
 

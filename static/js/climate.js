@@ -246,25 +246,15 @@ async function _loadCountryBoundary(regionId) {
   try {
     // Use cache if available
     if (!_geoCache[regionId]) {
-      const BASE = 'https://www.geoboundaries.org/api/current/gbOpen';
-      // Fetch metadata for ADM0 and ADM1 in parallel
-      const [m0, m1] = await Promise.all([
-        fetch(`${BASE}/${iso3}/ADM0/`).then(r => r.json()),
-        fetch(`${BASE}/${iso3}/ADM1/`).then(r => r.json()),
-      ]);
-
-      // Prefer simplified GeoJSON for performance.
-      // Download GeoJSON through our Flask proxy so the browser avoids GitHub
-      // CORS restrictions and Git-LFS pointer redirects.
-      const _proxyUrl = u => `/api/proxy/boundary?url=${encodeURIComponent(u)}`;
-      const url0 = _proxyUrl(m0.simplifiedGeojsonURL || m0.gjDownloadURL);
-      const url1 = _proxyUrl(m1.simplifiedGeojsonURL || m1.gjDownloadURL);
-
+      // Use the GEE-backed boundary endpoint (FAO/GAUL_SIMPLIFIED_500m/2015)
+      // instead of the external geoBoundaries.org API.  This avoids an
+      // unreliable third-party dependency and GitHub CORS / LFS issues.
       const [adm0, adm1] = await Promise.all([
-        fetch(url0).then(r => r.json()),
-        fetch(url1).then(r => r.json()),
+        fetch(`/api/geo/boundary?iso3=${iso3}&level=ADM0`).then(r => r.json()),
+        fetch(`/api/geo/boundary?iso3=${iso3}&level=ADM1`).then(r => r.json()),
       ]);
 
+      if (!adm0.features?.length) throw new Error('No ADM0 boundary returned');
       _geoCache[regionId] = { adm0, adm1 };
     }
 
@@ -331,6 +321,7 @@ function _applyBoundaries(regionId, { adm0, adm1 }) {
   (adm1.features || []).forEach(feat => {
     const name = feat.properties?.shapeName
                || feat.properties?.NAME_1
+               || feat.properties?.ADM1_NAME
                || feat.properties?.name
                || feat.properties?.ADM1_EN
                || '';
