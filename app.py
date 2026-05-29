@@ -3,7 +3,9 @@ app.py – ANSASphere Flask application factory.
 """
 
 import logging
+import logging.handlers
 import os
+import pathlib
 from dotenv import load_dotenv
 load_dotenv()  # must run before config.py reads os.environ
 from flask import Flask, render_template
@@ -30,7 +32,6 @@ def _configure_logging():
     root.setLevel(log_level)
 
     if os.environ.get("FLASK_ENV") == "production":
-        import logging.handlers, pathlib
         log_dir = pathlib.Path(__file__).parent / "data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
