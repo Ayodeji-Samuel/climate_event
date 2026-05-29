@@ -470,8 +470,12 @@ class ClimateLayerAnalyzer:
             gaul_name = self._GAUL_NAMES.get(region_id)
             if gaul_name:
                 try:
+                    # Use the 500 m-simplified GAUL dataset — same ADM0_NAME
+                    # field, but the polygon has far fewer vertices, making
+                    # every downstream clip() and reduceRegion() significantly
+                    # faster than the full-resolution FAO/GAUL/2015/level0.
                     geom = (
-                        ee.FeatureCollection("FAO/GAUL/2015/level0")
+                        ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0")
                           .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
                           .geometry()
                     )

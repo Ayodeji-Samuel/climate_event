@@ -424,11 +424,16 @@ async function runClimateAnalysis() {
   _clearStats();
   _hideAlertBox();
 
+  // Abort the fetch after 2 minutes so the spinner never hangs forever.
+  const controller  = new AbortController();
+  const _abortTimer = setTimeout(() => controller.abort(), 120_000);
+
   try {
     const params = new URLSearchParams({ layer_id: _cs.selectedLayer, region_id: regionId });
     if (date) params.set('date', date);
 
-    const res = await fetch(`/api/climate/analyze?${params}`);
+    const res = await fetch(`/api/climate/analyze?${params}`, { signal: controller.signal });
+    clearTimeout(_abortTimer);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     const result = json.result || {};
@@ -459,8 +464,12 @@ async function runClimateAnalysis() {
     if (trendBtn) trendBtn.style.display = '';
 
   } catch (err) {
-    _climateToast(`Error: ${err.message}`, 'error');
-    _showStats({ error: err.message });
+    clearTimeout(_abortTimer);
+    const msg = err.name === 'AbortError'
+      ? 'Analysis timed out (>2 min). Try a different date or region.'
+      : (err.message || String(err));
+    _climateToast(msg, 'error');
+    _showStats({ error: msg });
   } finally {
     _setLoading(false);
   }
@@ -630,7 +639,7 @@ function _setLoading(on, label) {
 ══════════════════════════════════════════════════════════════ */
 function _climateToast(msg, type) {
   if (typeof showToast === 'function') {
-    showToast(msg, type);
+    showToast('Climate Monitor', msg, type);   // showToast(title, message, type)
   } else {
     console.warn('[ClimateMonitor]', msg);
   }
