@@ -17,10 +17,38 @@ from modules.ai_agent import AIAgent
 from modules.alert_system import AlertSystem
 from api.routes import api_bp
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+def _configure_logging():
+    """
+    In production (FLASK_ENV=production) write logs to a rotating file so
+    that PythonAnywhere WSGI workers never hit OSError: write error on the
+    closed stdout/stderr streams.  In development, keep the console handler.
+    """
+    log_level = logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
+    if os.environ.get("FLASK_ENV") == "production":
+        import logging.handlers, pathlib
+        log_dir = pathlib.Path(__file__).parent / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            log_dir / "ansasphere.log",
+            maxBytes=5 * 1024 * 1024,   # 5 MB per file
+            backupCount=2,               # keep 2 rotated files → ≤15 MB total
+            encoding="utf-8",
+        )
+    else:
+        handler = logging.StreamHandler()
+
+    handler.setFormatter(logging.Formatter(fmt))
+    # Avoid adding duplicate handlers on reload
+    if not root.handlers:
+        root.addHandler(handler)
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 
