@@ -21,10 +21,15 @@ env/
 
 # GEE / Google service-account credentials
 *.json
+# ...but the generated Nigeria boundary index is public data the app needs
+!static/geo/**/*.json
 
 # Database / data files
 data/*.db
 data/*.sqlite
+data/logs/
+# IP → country database (downloaded by scripts/update_geoip.py)
+data/geoip/
 
 # IDE
 .vscode/

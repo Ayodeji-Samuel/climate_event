@@ -5,10 +5,10 @@ Multi-layer environmental analysis using Google Earth Engine.
 Supported layers (15):
   vegetation       – NDVI from MODIS/Sentinel-2
   land_cover       – ESA WorldCover / MODIS IGBP classification
-  heatwaves        – ERA5 temperature anomaly (deviation from 20-yr mean)
-  fires            – FIRMS active fire radiative power (VIIRS)
+  heatwaves        – MODIS LST anomaly vs a 3-year baseline
+  fires            – VIIRS 375 m active fires (NASA LANCE) / MODIS FIRMS fallback
   temperature      – MODIS Land Surface Temperature (LST)
-  soil_moisture    – SMAP 10 km soil moisture index
+  soil_moisture    – SMAP L4 9 km surface soil moisture
   deformation      – Sentinel-1 InSAR coherence proxy (mean coherence drop)
   forest_structure – Hansen Global Forest Change canopy cover + loss
   elevation        – SRTM DEM + slope/aspect
@@ -16,22 +16,23 @@ Supported layers (15):
   snow             – MODIS daily snow cover fraction
   crop_stress      – Sentinel-2 NDWI / LAI crop health composite
   pollution        – Sentinel-5P NO2 + aerosol optical depth
-  sea_level        – GRACE-FO land water equivalent (coastal proxy)
+  sea_level        – GRACE/GRACE-FO mascon water storage anomaly (coastal proxy)
   glacier          – GLIMS glacier outlines + Landsat snowline elevation
 
 Cache: all results compressed with zlib (lossless) in the shared GEECache.
 Stats: floats rounded to 4 significant digits before caching to reduce size.
 Tile URLs: short-lived (~1 h) EE map tile URLs — not compressed (strings).
+Regions: Nigeria, its 37 states and 774 LGAs (modules/nigeria_admin.py).
 """
 
 import json
 import logging
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from modules.gee_engine import GEEEngine
+from modules.nigeria_admin import ADMIN
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +94,19 @@ LAYER_CATALOGUE: Dict[str, Dict] = {
     },
     "heatwaves": {
         "label": "Heatwaves",
-        "description": "LST anomaly relative to ERA5 20-year baseline. Values > 3 °C indicate heat stress.",
+        "description": "Land surface temperature over the last 20 days vs a 3-year MODIS baseline. Values > 3 °C indicate heat stress.",
         "unit": "°C anomaly",
         "icon": "🌡️",
         "category": "climate",
-        "dataset": "MODIS/061/MOD11A1 + ERA5 baseline",
+        "dataset": "MODIS/061/MOD11A1",
     },
     "fires": {
         "label": "Active Fires",
-        "description": "FIRMS VIIRS 375 m active fire detections and fire radiative power.",
+        "description": "NOAA-20 VIIRS 375 m active fire detections and fire radiative power (NASA LANCE); MODIS 1 km FIRMS for dates before Oct 2023.",
         "unit": "MW (fire radiative power)",
         "icon": "🔥",
         "category": "hazard",
-        "dataset": "NASA/FIRMS/noaa-20-viirs-c2",
+        "dataset": "NASA/LANCE/NOAA20_VIIRS/C2 + FIRMS",
     },
     "temperature": {
         "label": "Land Surface Temperature",
@@ -117,11 +118,11 @@ LAYER_CATALOGUE: Dict[str, Dict] = {
     },
     "soil_moisture": {
         "label": "Soil Moisture",
-        "description": "SMAP L4 10 km soil moisture (surface 0–5 cm).",
+        "description": "SMAP L4 9 km, 3-hourly surface soil moisture (0–5 cm), 10-day mean.",
         "unit": "m³/m³",
         "icon": "💧",
         "category": "land",
-        "dataset": "NASA_USDA/HSL/SMAP10KM_soil_moisture",
+        "dataset": "NASA/SMAP/SPL4SMGP/008",
     },
     "deformation": {
         "label": "Ground Deformation",
@@ -181,11 +182,11 @@ LAYER_CATALOGUE: Dict[str, Dict] = {
     },
     "sea_level": {
         "label": "Sea Level / Water Storage",
-        "description": "GRACE-FO terrestrial water storage anomaly — coastal inundation proxy.",
+        "description": "GRACE/GRACE-FO JPL mascon terrestrial water storage anomaly (latest month available — releases lag by months).",
         "unit": "cm equivalent water height",
         "icon": "🌊",
         "category": "ocean",
-        "dataset": "NASA/GRACE/MASS_GRIDS_V04/LAND",
+        "dataset": "NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI",
     },
     "glacier": {
         "label": "Glacier / Ice",
@@ -283,8 +284,8 @@ class ClimateLayerAnalyzer:
                               unit="°C", label="Surface Temp (LST)"),
         "rainfall":      dict(col="UCSB-CHG/CHIRPS/DAILY", band="precipitation", scale=5000,
                               reducer="sum", unit="mm", label="Monthly Rainfall"),
-        "soil_moisture": dict(col="NASA_USDA/HSL/SMAP10KM_soil_moisture", band="ssm",
-                              scale=10000, reducer="mean",
+        "soil_moisture": dict(col="NASA/SMAP/SPL4SMGP/008", band="sm_surface",
+                              scale=11000, reducer="mean", sample_hour=1,  # 01:30 UTC granule
                               unit="m³/m³", label="Soil Moisture"),
         "snow":          dict(col="MODIS/061/MOD10A1", band="NDSI_Snow_Cover", scale=500,
                               reducer="mean", unit="% cover", label="Snow Cover"),
@@ -292,11 +293,14 @@ class ClimateLayerAnalyzer:
                               band="tropospheric_NO2_column_number_density",
                               scale=1000, mul=1e5, reducer="mean",
                               unit="×10⁻⁵ mol/m²", label="NO₂ Column"),
-        "sea_level":     dict(col="NASA/GRACE/MASS_GRIDS_V04/LAND",
+        "sea_level":     dict(col="NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI",
                               band="lwe_thickness", scale=50000, reducer="mean",
+                              lagged=True,   # releases trail by months
                               unit="cm EWH", label="Water Storage"),
-        "fires":         dict(col="NASA/FIRMS/noaa-20-viirs-c2", band="T21",
-                              scale=375, threshold=330, reducer="count_threshold",
+        # MODIS FIRMS (2000 →) rather than VIIRS LANCE (Oct 2023 →) so a
+        # 24-month trend always has a full record.
+        "fires":         dict(col="FIRMS", band="T21",
+                              scale=1000, threshold=330, reducer="count_threshold",
                               unit="fire pixels", label="Fire Detections"),
         "glacier":       dict(col="MODIS/061/MOD10A1", band="NDSI_Snow_Cover", scale=500,
                               reducer="mean", unit="% snow/ice", label="Snow/Ice Cover"),
@@ -359,23 +363,6 @@ class ClimateLayerAnalyzer:
         ("deformation","soil_moisture"): "High soil moisture reduces shear strength, raising deformation risk.",
     }
 
-    # Maps region_id → country name as it appears in FAO/GAUL/2015/level0 (ADM0_NAME field).
-    # Used by _get_aoi to fetch the exact country polygon for precise raster masking.
-    _GAUL_NAMES: Dict[str, str] = {
-        "nigeria":     "Nigeria",
-        "ghana":       "Ghana",
-        "kenya":       "Kenya",
-        "ethiopia":    "Ethiopia",
-        "mozambique":  "Mozambique",
-        "bangladesh":  "Bangladesh",
-        "india":       "India",
-        "pakistan":    "Pakistan",
-        "myanmar":     "Myanmar",
-        "thailand":    "Thailand",
-        "indonesia":   "Indonesia",
-        "tanzania":    "United Republic of Tanzania",
-    }
-
 
     def __init__(self, gee_engine: GEEEngine):
         self._gee = gee_engine
@@ -407,9 +394,18 @@ class ClimateLayerAnalyzer:
         if layer_id not in LAYER_CATALOGUE:
             return {"success": False, "message": f"Unknown layer: {layer_id}",
                     "layer_id": layer_id}
+        if not bbox and ADMIN.get(region_id) is None:
+            return {"success": False, "message": f"Unknown region: {region_id}",
+                    "layer_id": layer_id, "region_id": region_id}
 
         date = date or datetime.utcnow().strftime("%Y-%m-%d")
-        cache_key = f"climate:{layer_id}:{region_id}:{date}"
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return {"success": False, "layer_id": layer_id, "region_id": region_id,
+                    "message": f"Invalid date '{date}' (expected YYYY-MM-DD)"}
+        bbox_key = ",".join(f"{v:.4f}" for v in bbox) if bbox else ""
+        cache_key = f"climate:{layer_id}:{region_id}:{bbox_key}:{date}"
 
         if use_cache:
             cached_bytes = self._gee.cache.get(cache_key)
@@ -430,8 +426,11 @@ class ClimateLayerAnalyzer:
         if "stats" in result and isinstance(result["stats"], dict):
             result["stats"] = _compact_stats(result["stats"])
 
-        ttl = self._TTL.get(layer_id, 3600)
-        self._gee.cache.set(cache_key, _compress(result), ttl=ttl)
+        # Only cache successes — caching a transient EE timeout would pin the
+        # failure for up to 24 h.
+        if result.get("success"):
+            ttl = self._TTL.get(layer_id, 3600)
+            self._gee.cache.set(cache_key, _compress(result), ttl=ttl)
         return result
 
     # ------------------------------------------------------------------
@@ -455,37 +454,26 @@ class ClimateLayerAnalyzer:
     # ------------------------------------------------------------------
 
     def _get_aoi(self, region_id: str, bbox: Optional[List[float]]):
-        """Return (ee_geometry, region_label).
+        """Return (ee_geometry, region_label, level).
 
-        Prefers the exact country polygon from FAO/GAUL so that .clip() and
-        .reduceRegion() operate on the true boundary, not a rectangular box.
-        Falls back to BBox if the region is not in _GAUL_NAMES.
+        Uses the exact country / state / LGA polygon from FAO GAUL 2025
+        (500 m simplified) so .clip() and .reduceRegion() follow the true
+        boundary — the same outline the map draws.
         """
-        from modules.flood_detector import KNOWN_REGIONS
         ee = self._gee._ee
         if bbox and len(bbox) == 4:
-            return ee.Geometry.BBox(*bbox), region_id
-        if region_id in KNOWN_REGIONS:
-            info = KNOWN_REGIONS[region_id]
-            gaul_name = self._GAUL_NAMES.get(region_id)
-            if gaul_name:
-                try:
-                    # Use the 500 m-simplified GAUL dataset — same ADM0_NAME
-                    # field, but the polygon has far fewer vertices, making
-                    # every downstream clip() and reduceRegion() significantly
-                    # faster than the full-resolution FAO/GAUL/2015/level0.
-                    geom = (
-                        ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level0")
-                          .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
-                          .geometry()
-                    )
-                    return geom, info["label"]
-                except Exception as exc:
-                    logger.debug("GAUL polygon lookup failed for %s: %s", region_id, exc)
-            # Fall back to bounding box
-            bb = info["bbox"]
-            return ee.Geometry.BBox(*bb), info["label"]
-        raise ValueError(f"Unknown region '{region_id}' and no bbox provided.")
+            return ee.Geometry.BBox(*bbox), "Custom area", "custom"
+        region = ADMIN.get(region_id)
+        if region is None:
+            raise ValueError(f"Unknown region '{region_id}'.")
+        return ADMIN.geometry(ee, region), region.label, region.level
+
+    @staticmethod
+    def _s(level: str, country: int, state: int, lga: int) -> int:
+        """reduceRegion scale (m) sized to the analysis unit: coarse enough for
+        a whole-country run to finish, fine enough that a small LGA still
+        covers many pixels."""
+        return {"country": country, "lga": lga}.get(level, state)
 
     def _tile(self, image, vis: Dict) -> Optional[str]:
         try:
@@ -501,7 +489,7 @@ class ClimateLayerAnalyzer:
     def _analyze_vegetation(self, region_id: str, date: str,
                              bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         # MODIS MOD13A1 16-day composites can lag 3-4 weeks in GEE ingestion;
         # 90-day window guarantees we always find the latest available composite.
@@ -523,7 +511,7 @@ class ClimateLayerAnalyzer:
             reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), "", True)
                                .combine(ee.Reducer.min(), "", True)
                                .combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 500, 250), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         if not stats or stats.get("NDVI_mean") is None:
@@ -556,13 +544,14 @@ class ClimateLayerAnalyzer:
     def _analyze_land_cover(self, region_id: str, date: str,
                              bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         img = ee.ImageCollection("ESA/WorldCover/v200").first().clip(aoi)
 
         # Class histogram (pixel counts per class)
         hist = img.reduceRegion(
             reducer=ee.Reducer.frequencyHistogram(),
-            geometry=aoi, scale=100, maxPixels=1e10,
+            geometry=aoi, scale=self._s(level, 300, 100, 10),
+            maxPixels=1e10, bestEffort=True, tileScale=4,
         ).getInfo()
         class_hist = hist.get("Map", {})
 
@@ -593,7 +582,7 @@ class ClimateLayerAnalyzer:
     def _analyze_heatwaves(self, region_id: str, date: str,
                             bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start      = (end - timedelta(days=20)).strftime("%Y-%m-%d")
         # 3-year baseline is statistically robust and substantially faster
@@ -614,7 +603,7 @@ class ClimateLayerAnalyzer:
 
         stats = anomaly.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 1000, 250), maxPixels=1e8, bestEffort=True,
         ).getInfo()
         mean_anom = stats.get("LST_Day_1km_mean", 0) or 0
         max_anom  = stats.get("LST_Day_1km_max", 0)  or 0
@@ -644,32 +633,20 @@ class ClimateLayerAnalyzer:
     def _analyze_fires(self, region_id: str, date: str,
                        bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=7)).strftime("%Y-%m-%d")
 
-        # Try FIRMS datasets in preference order (some may require separate access)
-        FIRE_SOURCES = [
-            "NASA/FIRMS/noaa-20-viirs-c2",
-            "NASA/FIRMS/suomi-npp-viirs-c2",
-            "NASA/FIRMS/modis/006/Terra",
-            "NASA/FIRMS/modis/006/Aqua",
-        ]
-        fires = None
-        count = 0
-        for ds_id in FIRE_SOURCES:
-            try:
-                col = (ee.ImageCollection(ds_id)
-                         .filterBounds(aoi)
-                         .filterDate(start, date)
-                         .select("T21"))
-                count = col.size().getInfo()   # raises if dataset inaccessible
-                fires = col
-                break
-            except Exception:
-                continue  # try next source
+        # NOAA-20 VIIRS (375 m, Oct 2023 →) catches the small agricultural and
+        # bush fires typical of Nigeria; MODIS FIRMS (1 km, 2000 →) covers
+        # older dates.  Both collections hold only fire pixels (rest masked).
+        viirs = (ee.ImageCollection("NASA/LANCE/NOAA20_VIIRS/C2")
+                   .filterBounds(aoi).filterDate(start, date))
+        modis = (ee.ImageCollection("FIRMS")
+                   .filterBounds(aoi).filterDate(start, date))
+        n_viirs, n_modis = ee.List([viirs.size(), modis.size()]).getInfo()
 
-        if fires is None or count == 0:
+        if not n_viirs and not n_modis:
             return {
                 "success": True,
                 "tile_url": None,
@@ -678,37 +655,52 @@ class ClimateLayerAnalyzer:
                     "estimated_fire_area_km2": 0.0,
                     "region": label,
                     "period": f"{start} → {date}",
-                    "note": ("No fire detections in this period/region."
-                             if fires is not None
-                             else "No accessible fire dataset for this query."),
+                    "note": "No fire detections in this period/region.",
                 },
             }
 
-        fire_img = fires.max().clip(aoi)
-        active = fire_img.gt(330)
-        fire_area = self._gee.compute_area_km2(active, aoi, scale=375)
+        if n_viirs:
+            source, scale, band = "NOAA-20 VIIRS 375 m", 375, "frp"
+            intensity = viirs.select(band).max()                 # MW
+            vis = {"min": 0, "max": 50,
+                   "palette": ["yellow", "orange", "red", "darkred"]}
+        else:
+            source, scale, band = "MODIS 1 km (FIRMS)", 1000, "T21"
+            intensity = modis.select(band).max()                 # K
+            vis = {"min": 300, "max": 400,
+                   "palette": ["yellow", "orange", "red", "darkred"]}
+        intensity = intensity.clip(aoi)
+        fire_px = intensity.mask().rename("fire").selfMask()      # 1 where detected
 
-        stats_raw = fire_img.reduceRegion(
-            reducer=ee.Reducer.max().combine(ee.Reducer.mean(), "", True)
-                               .combine(ee.Reducer.count(), "", True),
-            geometry=aoi, scale=375, maxPixels=1e10,
-        ).getInfo()
+        region_kw = dict(geometry=aoi, scale=scale, maxPixels=1e10,
+                         bestEffort=True, tileScale=4)
+        stats_raw = ee.Dictionary({
+            "pixels": fire_px.reduceRegion(reducer=ee.Reducer.count(), **region_kw).get("fire"),
+            "area_m2": fire_px.multiply(ee.Image.pixelArea())
+                              .reduceRegion(reducer=ee.Reducer.sum(), **region_kw).get("fire"),
+            "intensity": intensity.reduceRegion(
+                reducer=ee.Reducer.max().combine(ee.Reducer.mean(), "", True), **region_kw),
+        }).getInfo()
+        inten = stats_raw.get("intensity") or {}
 
-        tile = self._tile(fire_img, {
-            "min": 300, "max": 400,
-            "palette": ["black", "purple", "red", "orange", "yellow", "white"],
-        })
+        stats = {
+            "active_fires": int(stats_raw.get("pixels") or 0),     # fire pixels detected
+            "estimated_fire_area_km2": round((stats_raw.get("area_m2") or 0) / 1e6, 2),
+            "source": source,
+            "region": label,
+            "period": f"{start} → {date}",
+        }
+        if n_viirs:
+            stats["max_frp_mw"] = inten.get("frp_max")
+            stats["mean_frp_mw"] = inten.get("frp_mean")
+        else:
+            stats["max_brightness_k"] = inten.get("T21_max")
+            stats["mean_brightness_k"] = inten.get("T21_mean")
+
         return {
             "success": True,
-            "tile_url": tile,
-            "stats": {
-                "max_brightness_k":       stats_raw.get("T21_max"),
-                "mean_brightness_k":      stats_raw.get("T21_mean"),
-                "pixel_count":            stats_raw.get("T21_count"),
-                "estimated_fire_area_km2": fire_area,
-                "region": label,
-                "period": f"{start} → {date}",
-            },
+            "tile_url": self._tile(intensity, vis),
+            "stats": stats,
         }
 
     # ------------------------------------------------------------------
@@ -718,26 +710,31 @@ class ClimateLayerAnalyzer:
     def _analyze_temperature(self, region_id: str, date: str,
                               bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
-        # 20-day window handles the 7-14 day MODIS ingestion lag
-        start = (end - timedelta(days=20)).strftime("%Y-%m-%d")
 
-        lst = (ee.ImageCollection("MODIS/061/MOD11A1")
-                 .filterBounds(aoi).filterDate(start, date)
-                 .select("LST_Day_1km")
-                 .mean()
-                 .multiply(0.02).subtract(273.15)
-                 .clip(aoi))
+        # 20-day window handles the 7-14 day MODIS ingestion lag.  LST is
+        # clear-sky only, and in the rainy season a small LGA (e.g. in Lagos)
+        # can be cloud-covered for weeks — widen to 60 days before giving up.
+        for window in (20, 60):
+            start = (end - timedelta(days=window)).strftime("%Y-%m-%d")
+            lst = (ee.ImageCollection("MODIS/061/MOD11A1")
+                     .filterBounds(aoi).filterDate(start, date)
+                     .select("LST_Day_1km")
+                     .mean()
+                     .multiply(0.02).subtract(273.15)
+                     .clip(aoi))
 
-        stats = lst.reduceRegion(
-            reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
-                               .combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
-        ).getInfo()
-
-        if not stats or stats.get("LST_Day_1km_mean") is None:
-            return {"success": False, "message": "No MODIS LST imagery available for this period.",
+            stats = lst.reduceRegion(
+                reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
+                                   .combine(ee.Reducer.max(), "", True),
+                geometry=aoi, scale=self._s(level, 1000, 1000, 250), maxPixels=1e8, bestEffort=True,
+            ).getInfo()
+            if stats and stats.get("LST_Day_1km_mean") is not None:
+                break
+        else:
+            return {"success": False,
+                    "message": "No cloud-free MODIS LST imagery in the last 60 days.",
                     "tile_url": None, "stats": {}}
 
         tile = self._tile(lst, {
@@ -767,20 +764,27 @@ class ClimateLayerAnalyzer:
     def _analyze_soil_moisture(self, region_id: str, date: str,
                                 bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=10)).strftime("%Y-%m-%d")
 
-        col = (ee.ImageCollection("NASA_USDA/HSL/SMAP10KM_soil_moisture")
+        # SMAP L4 v008, 3-hourly 9 km.  (NASA_USDA/HSL/SMAP10KM_soil_moisture,
+        # used previously, stopped on 2022-08-02 and returned only nulls.)
+        col = (ee.ImageCollection("NASA/SMAP/SPL4SMGP/008")
                  .filterBounds(aoi).filterDate(start, date)
-                 .select("ssm"))   # surface soil moisture
+                 .select("sm_surface"))   # surface (0–5 cm) soil moisture
         img = col.mean().clip(aoi)
 
         stats = img.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
                                .combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=10000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 11000, 5000, 1000), maxPixels=1e8, bestEffort=True,
         ).getInfo()
+
+        if not stats or stats.get("sm_surface_mean") is None:
+            return {"success": False,
+                    "message": "No SMAP soil moisture data available for this period.",
+                    "tile_url": None, "stats": {}}
 
         tile = self._tile(img, {
             "min": 0.0, "max": 0.5,
@@ -790,9 +794,9 @@ class ClimateLayerAnalyzer:
             "success": True,
             "tile_url": tile,
             "stats": {
-                "ssm_mean_m3m3": stats.get("ssm_mean"),
-                "ssm_min_m3m3":  stats.get("ssm_min"),
-                "ssm_max_m3m3":  stats.get("ssm_max"),
+                "ssm_mean_m3m3": stats.get("sm_surface_mean"),
+                "ssm_min_m3m3":  stats.get("sm_surface_min"),
+                "ssm_max_m3m3":  stats.get("sm_surface_max"),
                 "region": label,
                 "period": f"{start} → {date}",
             },
@@ -805,7 +809,7 @@ class ClimateLayerAnalyzer:
     def _analyze_deformation(self, region_id: str, date: str,
                               bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=30)).strftime("%Y-%m-%d")
         ref_start = (end - timedelta(days=90)).strftime("%Y-%m-%d")
@@ -825,7 +829,7 @@ class ClimateLayerAnalyzer:
 
         stats = diff.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=500, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 500, 200, 50), maxPixels=1e8, bestEffort=True,
         ).getInfo()
         mean_diff = stats.get("VV_mean", 0) or 0
         deform_flag = bool(abs(mean_diff) > 3.0)
@@ -853,7 +857,7 @@ class ClimateLayerAnalyzer:
     def _analyze_forest_structure(self, region_id: str, date: str,
                                    bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         gfc = ee.Image("UMD/hansen/global_forest_change_2023_v1_11").clip(aoi)
         canopy   = gfc.select("treecover2000")
         loss     = gfc.select("loss")
@@ -861,12 +865,15 @@ class ClimateLayerAnalyzer:
 
         # Total canopy area & loss area
         canopy_binary = canopy.gt(10)   # > 10 % cover = forest
-        forest_km2 = self._gee.compute_area_km2(canopy_binary, aoi, scale=30)
-        loss_km2   = self._gee.compute_area_km2(loss, aoi, scale=30)
+        # 30 m over all of Nigeria is ~1e9 pixels per sum — too slow for a
+        # web request; coarser scales for larger units.
+        area_scale = self._s(level, 300, 100, 30)
+        forest_km2 = self._gee.compute_area_km2(canopy_binary, aoi, scale=area_scale)
+        loss_km2   = self._gee.compute_area_km2(loss, aoi, scale=area_scale)
 
         stats_cc = canopy.reduceRegion(
             reducer=ee.Reducer.mean(),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 300, 30), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         tile = self._tile(canopy, {
@@ -892,7 +899,7 @@ class ClimateLayerAnalyzer:
     def _analyze_elevation(self, region_id: str, date: str,
                             bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         dem = ee.Image("USGS/SRTMGL1_003").clip(aoi)
         terrain = ee.Algorithms.Terrain(dem)
         elevation = terrain.select("elevation")
@@ -901,7 +908,7 @@ class ClimateLayerAnalyzer:
         stats = elevation.addBands(slope).reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
                                .combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 300, 30), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         tile = self._tile(elevation, {
@@ -928,12 +935,12 @@ class ClimateLayerAnalyzer:
     def _analyze_rainfall(self, region_id: str, date: str,
                            bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
-        # CHIRPS daily final product lags 3-6 weeks; preliminary is ~2-3 days.
-        # Search 30-day window and take the 5 most-recent available days so we
-        # always obtain data regardless of publication delay.
-        window_start = (end - timedelta(days=30)).strftime("%Y-%m-%d")
+        # CHIRPS daily lags ~4 weeks in Earth Engine.  Search a 60-day window
+        # and take the 5 most-recent available days so we always obtain data
+        # regardless of publication delay.
+        window_start = (end - timedelta(days=60)).strftime("%Y-%m-%d")
 
         col = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
                  .filterBounds(aoi)
@@ -946,7 +953,7 @@ class ClimateLayerAnalyzer:
 
         stats = accum.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=5500, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 5500, 5500, 1000), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         if not stats or stats.get("precipitation_mean") is None:
@@ -976,7 +983,7 @@ class ClimateLayerAnalyzer:
     def _analyze_snow(self, region_id: str, date: str,
                       bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=8)).strftime("%Y-%m-%d")
 
@@ -987,13 +994,14 @@ class ClimateLayerAnalyzer:
 
         stats = img.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 500, 250), maxPixels=1e8, bestEffort=True,
         ).getInfo()
         mean_snow = stats.get("NDSI_Snow_Cover_mean", 0) or 0
 
         # Area with > 50 % snow cover
         snow_binary = img.gt(50)
-        snow_area_km2 = self._gee.compute_area_km2(snow_binary, aoi, scale=500)
+        snow_area_km2 = self._gee.compute_area_km2(
+            snow_binary, aoi, scale=self._s(level, 1000, 500, 250))
 
         tile = self._tile(img, {
             "min": 0, "max": 100,
@@ -1018,7 +1026,7 @@ class ClimateLayerAnalyzer:
     def _analyze_crop_stress(self, region_id: str, date: str,
                               bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=20)).strftime("%Y-%m-%d")
 
@@ -1043,7 +1051,7 @@ class ClimateLayerAnalyzer:
         stress = ndwi.multiply(-1).add(evi.multiply(-0.5)).rename("stress")
         stats = ndwi.addBands(evi).reduceRegion(
             reducer=ee.Reducer.mean(),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 300, 30), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         tile = self._tile(evi, {
@@ -1069,7 +1077,7 @@ class ClimateLayerAnalyzer:
     def _analyze_pollution(self, region_id: str, date: str,
                             bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=14)).strftime("%Y-%m-%d")
 
@@ -1114,20 +1122,36 @@ class ClimateLayerAnalyzer:
     def _analyze_sea_level(self, region_id: str, date: str,
                            bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
-        end = datetime.strptime(date, "%Y-%m-%d")
-        start = (end - timedelta(days=60)).strftime("%Y-%m-%d")
-
-        col = (ee.ImageCollection("NASA/GRACE/MASS_GRIDS_V04/LAND")
-                 .filterBounds(aoi).filterDate(start, date)
+        aoi, label, level = self._get_aoi(region_id, bbox)
+        # GRACE/GRACE-FO monthly mascons are released months late (the LAND
+        # grids used previously ended in 2017), so use the latest month
+        # available on or before the requested date and report which it is.
+        col = (ee.ImageCollection("NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI")
+                 .filterDate("2002-01-01", date)
                  .select("lwe_thickness"))
-        img = col.mean().clip(aoi)   # cm equivalent water height
+        latest = ee.Image(col.sort("system:time_start", False).first())
+        img = latest.clip(aoi)   # cm equivalent water height
 
-        stats = img.reduceRegion(
-            reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
-                               .combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=50000, maxPixels=1e8, bestEffort=True,
-        ).getInfo()
+        info = ee.Dictionary({
+            "n": col.size(),
+            "month": ee.Algorithms.If(
+                col.size().gt(0),
+                ee.Date(latest.get("system:time_start")).format("YYYY-MM"), None),
+            "stats": ee.Algorithms.If(col.size().gt(0), img.reduceRegion(
+                reducer=ee.Reducer.mean().combine(ee.Reducer.min(), "", True)
+                                   .combine(ee.Reducer.max(), "", True),
+                # Mascons are ~55 km; finer scales keep small LGAs from
+                # falling between pixel centres.
+                geometry=aoi, scale=self._s(level, 25000, 10000, 2000),
+                maxPixels=1e8, bestEffort=True,
+            ), None),
+        }).getInfo()
+        if not info.get("n") or not info.get("stats"):
+            return {"success": False,
+                    "message": "No GRACE water-storage data available on or before this date.",
+                    "tile_url": None, "stats": {}}
+        stats = info["stats"]
+        start = f"{info['month']} (latest GRACE month)"
         mean_lwe = stats.get("lwe_thickness_mean", 0) or 0
 
         tile = self._tile(img, {
@@ -1144,7 +1168,7 @@ class ClimateLayerAnalyzer:
                 "lwe_max_cm":    stats.get("lwe_thickness_max"),
                 "water_anomaly_positive": bool(mean_lwe > 2.0),
                 "region": label,
-                "period": f"{start} → {date} (60-day mean)",
+                "period": start,
             },
         }
 
@@ -1155,7 +1179,7 @@ class ClimateLayerAnalyzer:
     def _analyze_glacier(self, region_id: str, date: str,
                           bbox: Optional[List[float]]) -> Dict:
         ee = self._gee._ee
-        aoi, label = self._get_aoi(region_id, bbox)
+        aoi, label, level = self._get_aoi(region_id, bbox)
         end = datetime.strptime(date, "%Y-%m-%d")
         start = (end - timedelta(days=30)).strftime("%Y-%m-%d")
 
@@ -1172,11 +1196,11 @@ class ClimateLayerAnalyzer:
         img = col.median().multiply(0.0000275).add(-0.2).clip(aoi)
         ndsi = img.normalizedDifference(["SR_B3","SR_B6"]).rename("NDSI")
         glacier = ndsi.gt(0.4)   # NDSI > 0.4 → snow/ice
-        glacier_km2 = self._gee.compute_area_km2(glacier, aoi, scale=30)
+        glacier_km2 = self._gee.compute_area_km2(glacier, aoi, scale=self._s(level, 300, 100, 30))
 
         stats = ndsi.reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.max(), "", True),
-            geometry=aoi, scale=1000, maxPixels=1e8, bestEffort=True,
+            geometry=aoi, scale=self._s(level, 1000, 300, 100), maxPixels=1e8, bestEffort=True,
         ).getInfo()
 
         tile = self._tile(ndsi, {
@@ -1245,23 +1269,33 @@ class ClimateLayerAnalyzer:
             }
 
         try:
-            aoi, label      = self._get_aoi(region_id, None)
-            correlate_ids   = self._LAYER_CORRELATES.get(layer_id, [])[:2]
+            ee = self._gee._ee
+            aoi, label, level = self._get_aoi(region_id, None)
+            correlate_ids = [c for c in self._LAYER_CORRELATES.get(layer_id, [])[:2]
+                             if self._SERIES_CFG.get(c)]
 
-            # --- run primary + correlates in parallel ----------------
-            def _series_for(c_id: str):
-                c_cfg = self._SERIES_CFG.get(c_id)
-                if c_cfg is None:
-                    return c_id, []
-                return c_id, self._compute_monthly_series(c_cfg, aoi, date, months)
+            # Datasets published months late (GRACE) would give an all-null
+            # window ending today; end the window — for every series, so the
+            # correlations line up — at the latest month actually available.
+            end_date = date
+            if cfg.get("lagged"):
+                last = (ee.ImageCollection(cfg["col"]).filterDate("2002-01-01", date)
+                          .aggregate_max("system:time_start").getInfo())
+                if last:
+                    end_date = datetime.utcfromtimestamp(last / 1000).strftime("%Y-%m-%d")
 
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                fut_primary  = ex.submit(
-                    self._compute_monthly_series, cfg, aoi, date, months
-                )
-                fut_corr     = {c: ex.submit(_series_for, c) for c in correlate_ids}
-                primary_series = fut_primary.result(timeout=120)
-                corr_results   = {c: f.result(timeout=120) for c, f in fut_corr.items()}
+            # Primary + correlates in ONE getInfo: Earth Engine evaluates the
+            # series in parallel server-side, so no Python threads are needed
+            # (PythonAnywhere web apps don't support them).
+            series = {"_primary": self._monthly_series(cfg, aoi, end_date, months, level)}
+            for c_id in correlate_ids:
+                series[c_id] = self._monthly_series(
+                    self._SERIES_CFG[c_id], aoi, end_date, months, level)
+            info = ee.Dictionary(series).getInfo()
+
+            primary_series = self._parse_series(info["_primary"], cfg)
+            corr_results = {c: (c, self._parse_series(info[c], self._SERIES_CFG[c]))
+                            for c in correlate_ids}
 
             primary = {
                 "label":  cfg.get("label", layer_id),
@@ -1306,12 +1340,15 @@ class ClimateLayerAnalyzer:
     # Monthly series computation helpers
     # ------------------------------------------------------------------
 
-    def _compute_monthly_series(
-        self, cfg: Dict, aoi, end_date: str, months: int
-    ) -> List[Dict]:
+    def _monthly_series(
+        self, cfg: Dict, aoi, end_date: str, months: int, level: str
+    ):
         """
-        Single GEE server-side call that returns N monthly {month, value} dicts.
-        Uses ee.List.sequence + map() to avoid N round-trips to the GEE API.
+        Server-side ee.List of N monthly {idx, month, value} features (lazy —
+        evaluated by the caller's single getInfo).  Uses ee.List.sequence +
+        map() to avoid N round-trips to the GEE API.  A plain List rather
+        than a FeatureCollection: nested inside an ee.Dictionary, getInfo()
+        returns only a FeatureCollection's schema, not its features.
         """
         ee = self._gee._ee
 
@@ -1324,15 +1361,21 @@ class ClimateLayerAnalyzer:
             y  -= 1
         start_ee = ee.Date(f"{y:04d}-{mo:02d}-01")
 
+        # Coarse datasets (GRACE ~55 km, SMAP 9 km) need a finer sampling
+        # scale for a small state or LGA to contain any pixel centre.
+        scale = cfg.get("scale", 5000)
+        if level != "country":
+            scale = min(scale, 5000 if level != "lga" else 1000)
+
         if cfg.get("reducer") == "count_threshold":
-            return self._compute_fire_monthly_series(cfg, aoi, start_ee, months)
+            return self._fire_monthly_series(cfg, aoi, start_ee, months, scale)
 
         col_id  = cfg["col"]
         band    = cfg["band"]
-        scale   = cfg.get("scale", 5000)
         mul     = cfg.get("mul")
         add_val = cfg.get("add")
         use_sum = cfg.get("reducer") == "sum"
+        sample_hour = cfg.get("sample_hour")
 
         # A fully-masked placeholder so reduceRegion returns null for empty months
         _empty_img = ee.Image.constant(0).rename(band).updateMask(ee.Image.constant(0))
@@ -1347,6 +1390,10 @@ class ClimateLayerAnalyzer:
                   .filterDate(ms, me)
                   .select(band)
             )
+            if sample_hour is not None:
+                # Sub-daily products: one image per day is plenty for a
+                # monthly mean and keeps EE under its memory limit.
+                col = col.filter(ee.Filter.calendarRange(sample_hour, sample_hour, "hour"))
             # Guard: empty collection → 0-band image which breaks multiply/add
             reduced = col.sum() if use_sum else col.mean()
             img = ee.Image(ee.Algorithms.If(col.size().gt(0), reduced, _empty_img))
@@ -1363,28 +1410,29 @@ class ClimateLayerAnalyzer:
             ).get(band)
             return ee.Feature(None, {"idx": m, "month": ms.format("YYYY-MM"), "value": val})
 
-        fc    = ee.FeatureCollection(ee.List.sequence(0, months - 1).map(make_feature))
-        info  = fc.getInfo()
-        feats = sorted(info["features"], key=lambda f: f["properties"].get("idx", 0))
+        return ee.List.sequence(0, months - 1).map(make_feature)
+
+    @staticmethod
+    def _parse_series(features: List[Dict], cfg: Dict) -> List[Dict]:
+        """Turn a getInfo'd list of monthly features into [{month, value}]."""
+        decimals = 1 if cfg.get("reducer") == "count_threshold" else 4
+        feats = sorted(features, key=lambda f: f["properties"].get("idx", 0))
         series = []
         for f in feats:
             p = f["properties"]
             v = p.get("value")
             series.append({
                 "month": p.get("month", ""),
-                "value": round(float(v), 4) if v is not None else None,
+                "value": round(float(v), decimals) if v is not None else None,
             })
         return series
 
-    def _compute_fire_monthly_series(
-        self, cfg: Dict, aoi, start_ee, months: int
-    ) -> List[Dict]:
-        """Count FIRMS fire pixels (T21 > threshold) per month."""
+    def _fire_monthly_series(self, cfg: Dict, aoi, start_ee, months: int, scale: int):
+        """Count FIRMS fire pixels (T21 > threshold) per month (lazy ee.List)."""
         ee        = self._gee._ee
         col_id    = cfg["col"]
         band      = cfg["band"]
         threshold = cfg.get("threshold", 330)
-        scale     = cfg.get("scale", 375)
 
         _empty_fire = ee.Image.constant(0).rename(band).updateMask(ee.Image.constant(0))
 
@@ -1412,18 +1460,7 @@ class ClimateLayerAnalyzer:
             ).get(band)
             return ee.Feature(None, {"idx": m, "month": ms.format("YYYY-MM"), "value": val})
 
-        fc    = ee.FeatureCollection(ee.List.sequence(0, months - 1).map(make_feature))
-        info  = fc.getInfo()
-        feats = sorted(info["features"], key=lambda f: f["properties"].get("idx", 0))
-        series = []
-        for f in feats:
-            p = f["properties"]
-            v = p.get("value")
-            series.append({
-                "month": p.get("month", ""),
-                "value": round(float(v), 1) if v is not None else None,
-            })
-        return series
+        return ee.List.sequence(0, months - 1).map(make_feature)
 
     def _trend_insight(
         self, layer_id: str, series: List[Dict], correlates: List[Dict]
@@ -1460,5 +1497,5 @@ class ClimateLayerAnalyzer:
             if c.get("description"):
                 parts.append(c["description"])
 
-        return ". ".join(parts) + "."
+        return ". ".join(p.rstrip(".") for p in parts) + "."
 

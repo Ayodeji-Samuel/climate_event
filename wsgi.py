@@ -1,9 +1,17 @@
 """
 wsgi.py – PythonAnywhere WSGI entry point.
-In PythonAnywhere Web tab, set:
-  Source code:  /home/<username>/climate_event
-  Working dir:  /home/<username>/climate_event
-  WSGI file:    /home/<username>/climate_event/wsgi.py
+
+In the PythonAnywhere Web tab:
+  Source code:        /home/<username>/climate_event
+  Working directory:  /home/<username>/climate_event
+  Virtualenv:         /home/<username>/climate_event/.venv   (Python 3.11+)
+  Static files:       URL /static/  →  /home/<username>/climate_event/static
+and make the WSGI configuration file (/var/www/<username>_pythonanywhere_com_wsgi.py)
+contain just:
+
+  import sys
+  sys.path.insert(0, "/home/<username>/climate_event")
+  from wsgi import application
 """
 
 import sys
@@ -16,6 +24,5 @@ if project_home not in sys.path:
 
 os.environ.setdefault("FLASK_ENV", "production")
 
-from app import create_app
-
-application = create_app("production")
+# app.py builds the app once at import; don't call create_app() a second time.
+from app import app as application  # noqa: E402

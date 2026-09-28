@@ -7,15 +7,22 @@ Agent capabilities:
   • analyze_flood_risk(region)  – live GEE flood analysis
   • list_active_alerts()        – pull current alert table
   • explain_risk_level(level)   – educational context
-  • summarize_stats(stats_dict) – human-readable summary
   • recommend_action(risk)      – response recommendation
+  • analyze_climate_layer(...)  – any of the 15 environmental layers
+  • list_lgas(state)            – LGAs of a Nigerian state
 
-Background scheduler: re-runs flood checks for monitored regions
-every MONITOR_INTERVAL seconds and auto-creates alerts.
+Regions are Nigeria, its 37 states (incl. FCT) and 774 LGAs; free-text
+names ("Surulere, Lagos", "Kogi") are resolved via modules/nigeria_admin.py.
+
+Monitor: re-runs flood checks for monitored regions and auto-creates alerts.
+On PythonAnywhere (no threads in web apps) run_monitor.py calls
+run_monitor_cycle() as a scheduled task; locally a background thread can
+be started instead.
 """
 
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -23,20 +30,36 @@ from typing import Dict, Any, Optional, List
 
 import requests as _requests
 
+from modules.nigeria_admin import ADMIN
+
 logger = logging.getLogger(__name__)
+
+MAX_HISTORY_MESSAGES = 30   # per chat session, to bound memory and token use
+MAX_SESSIONS = 200
 
 SYSTEM_PROMPT = (
     "You are ANSA, the AI assistant for ANSASphere — a real-time environmental "
-    "intelligence platform powered by Google Earth Engine satellite data. "
+    "intelligence platform for Nigeria powered by Google Earth Engine satellite data. "
+    "You can analyse the whole country, any of its 36 states plus the FCT, or any of "
+    "its 774 Local Government Areas (LGAs). "
     "You have tools to run live analyses for 15 environmental layers: "
     "flood risk (Sentinel-1 SAR), vegetation (NDVI), land cover, heatwaves, "
     "active fires, land surface temperature, soil moisture, ground deformation, "
     "forest structure, elevation/terrain, rainfall (CHIRPS), snow cover, "
-    "crop stress, air pollution (NO\u2082), sea level/water storage, and glaciers. "
-    "You can also check active alerts and recommend emergency actions. "
+    "crop stress, air pollution (NO₂), sea level/water storage, and glaciers. "
+    "You can also check active alerts, list a state's LGAs and recommend emergency actions. "
     "Be concise, precise, and action-oriented. Always cite the satellite dataset and date. "
     "When risk is elevated, prioritise life-safety information."
 )
+
+_REGION_PARAM = {
+    "type": "string",
+    "description": (
+        "'nigeria', a state id (e.g. 'lagos', 'kogi', 'akwa-ibom', 'fct') or an LGA "
+        "as 'state/lga' (e.g. 'lagos/surulere', 'rivers/port-harcourt'). Plain names "
+        "such as 'Surulere, Lagos' are also accepted."
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -45,16 +68,13 @@ TOOL_DECLARATIONS = [
     {
         "name": "analyze_flood_risk",
         "description": (
-            "Run a real-time Sentinel-1 SAR flood analysis for a given region "
+            "Run a real-time Sentinel-1 SAR flood analysis for Nigeria, a state or an LGA "
             "and return flood extent, area statistics, and risk level."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "region_id": {
-                    "type": "string",
-                    "description": "Region identifier e.g. 'nigeria', 'kenya', 'bangladesh'",
-                },
+                "region_id": _REGION_PARAM,
                 "event_date": {
                     "type": "string",
                     "description": "ISO date (YYYY-MM-DD) for the analysis window. Defaults to today.",
@@ -111,10 +131,7 @@ TOOL_DECLARATIONS = [
                         "snow, crop_stress, pollution, sea_level, glacier"
                     ),
                 },
-                "region_id": {
-                    "type": "string",
-                    "description": "Region identifier e.g. 'nigeria', 'kenya', 'bangladesh'",
-                },
+                "region_id": _REGION_PARAM,
                 "date": {
                     "type": "string",
                     "description": "ISO date (YYYY-MM-DD). Defaults to today.",
@@ -128,6 +145,17 @@ TOOL_DECLARATIONS = [
         "description": "Return the catalogue of all 15 available environmental monitoring layers.",
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "name": "list_lgas",
+        "description": "List the Local Government Areas (id and name) of a Nigerian state.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "description": "State id or name, e.g. 'lagos', 'Akwa Ibom'"},
+            },
+            "required": ["state"],
+        },
+    },
 ]
 
 # Build OPENROUTER_TOOLS from TOOL_DECLARATIONS (done after the list is fully defined)
@@ -136,25 +164,27 @@ OPENROUTER_TOOLS = [
     for t in TOOL_DECLARATIONS
 ]
 
-# Risk explanations (fallback)
+# Risk explanations (fallback).  {pct} is filled with the configured minimum
+# flooded-area fraction for that level (config.FLOOD_*_THRESHOLD).
 RISK_EXPLANATIONS = {
     0: "No significant flooding detected. Normal conditions prevail.",
     1: (
         "WATCH: Minor flooding possible in low-lying areas. "
-        "Less than 5 % of the region shows anomalous water extent. "
-        "Monitor conditions and stay informed."
+        "At least {pct} of the area shows new surface water compared with the same "
+        "season last year. Monitor conditions and stay informed."
     ),
     2: (
-        "ADVISORY: Moderate flooding likely. 5–15 % of the region shows elevated "
-        "water extent compared to baseline. Prepare emergency kits; avoid flood-prone routes."
+        "ADVISORY: Moderate flooding likely. At least {pct} of the area shows new "
+        "surface water. Prepare emergency kits; avoid flood-prone routes."
     ),
     3: (
-        "WARNING: Significant flooding underway. 15–30 % of the region is affected. "
-        "Evacuate low-lying areas. Activate local emergency response protocols."
+        "WARNING: Significant flooding underway. At least {pct} of the area is newly "
+        "inundated. Evacuate low-lying areas. Activate local emergency response protocols."
     ),
     4: (
-        "EMERGENCY: Catastrophic flooding. Over 30 % of the region is inundated. "
-        "Immediate evacuation required. Coordinate with national disaster agencies."
+        "EMERGENCY: Severe flooding. At least {pct} of the area is newly inundated. "
+        "Immediate evacuation required. Coordinate with NEMA and the State Emergency "
+        "Management Agency (SEMA)."
     ),
 }
 
@@ -176,13 +206,13 @@ RECOMMENDED_ACTIONS = {
     3: [
         "Issue mandatory evacuation orders for high-risk zones",
         "Deploy search-and-rescue teams",
-        "Activate national emergency operations centre",
+        "Activate the State Emergency Operations Centre",
         "Request military/NGO support",
         "Establish temporary medical posts",
     ],
     4: [
-        "Declare national disaster",
-        "Request international humanitarian assistance",
+        "Declare a state of emergency",
+        "Request federal (NEMA) and international humanitarian assistance",
         "Aerial rescue operations for stranded communities",
         "Mass casualty management protocols",
         "Full mobilisation of all emergency services",
@@ -190,16 +220,23 @@ RECOMMENDED_ACTIONS = {
 }
 
 
+def _has_word(text: str, words) -> bool:
+    """Whole-word keyword test ('do' must not match 'Ondo' or 'today')."""
+    return any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)
+
+
 class AIAgent:
     """
     Conversational AI agent with tool-calling capability.
-    Detects Gemini availability at init time; degrades gracefully.
+    Detects OpenRouter availability at init time; degrades gracefully.
     """
 
     def __init__(self, flood_detector, alert_system,
                  openrouter_api_key: str = "",
                  openrouter_model: str = "openai/gpt-4o-mini",
-                 climate_layers=None):
+                 climate_layers=None,
+                 monitored_regions: Optional[List[str]] = None,
+                 threads_allowed: bool = True):
         self.detector = flood_detector
         self.alerts = alert_system
         self.climate = climate_layers   # ClimateLayerAnalyzer (may be None)
@@ -209,11 +246,13 @@ class AIAgent:
         self._chat_histories: Dict[str, List[Dict]] = {}   # session_id → message list
         self._lock = threading.Lock()
 
-        # Background monitor state
+        # Monitor state
+        self.threads_allowed = threads_allowed
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_running = False
-        self._monitored_regions: List[str] = ["nigeria", "kenya", "bangladesh"]
-        self._last_monitor_run: Optional[str] = None
+        self._monitored_regions: List[str] = [
+            r for r in (monitored_regions or ["nigeria"]) if ADMIN.get(r)
+        ] or ["nigeria"]
 
         self._init_openrouter()
 
@@ -257,12 +296,28 @@ class AIAgent:
     # OpenRouter multi-turn chat with tool calling
     # ------------------------------------------------------------------
 
-    def _openrouter_chat(self, message: str, session_id: str) -> Dict[str, Any]:
+    def _session_history(self, session_id: str) -> List[Dict]:
         with self._lock:
             if session_id not in self._chat_histories:
+                if len(self._chat_histories) >= MAX_SESSIONS:
+                    # Drop the oldest session (dicts keep insertion order)
+                    self._chat_histories.pop(next(iter(self._chat_histories)))
                 self._chat_histories[session_id] = []
-            history = self._chat_histories[session_id]
+            return self._chat_histories[session_id]
 
+    @staticmethod
+    def _trim_history(history: List[Dict]):
+        """Keep the last MAX_HISTORY_MESSAGES, starting at a user turn so no
+        tool result is left without the assistant message that requested it."""
+        if len(history) <= MAX_HISTORY_MESSAGES:
+            return
+        del history[:len(history) - MAX_HISTORY_MESSAGES]
+        while history and history[0].get("role") != "user":
+            history.pop(0)
+
+    def _openrouter_chat(self, message: str, session_id: str) -> Dict[str, Any]:
+        history = self._session_history(session_id)
+        self._trim_history(history)
         history.append({"role": "user", "content": message})
         tool_results = []
 
@@ -304,7 +359,8 @@ class AIAgent:
                 }
 
             # Process tool calls
-            history.append(choice)
+            history.append({"role": "assistant", "content": choice.get("content"),
+                            "tool_calls": choice["tool_calls"]})
             for tc in choice["tool_calls"]:
                 fn_name = tc["function"]["name"]
                 try:
@@ -327,28 +383,38 @@ class AIAgent:
     # Rule-based fallback
     # ------------------------------------------------------------------
 
+    def _risk_explanation(self, level: int) -> str:
+        pct = self.detector.thresholds.get(level)
+        text = RISK_EXPLANATIONS.get(level, "Unknown level.")
+        return text.format(pct=f"{pct * 100:g} %") if pct is not None else text
+
     def _rule_based_chat(self, message: str) -> Dict[str, Any]:
         msg_lower = message.lower()
         tool_calls = []
 
         # --- Route to tool based on keywords ---
-        if any(w in msg_lower for w in ["flood", "water", "inundation", "risk", "analyze", "check"]):
-            region_id = self._extract_region(msg_lower)
+        if _has_word(msg_lower, ["flood", "floods", "flooding", "water", "inundation",
+                                 "risk", "analyze", "analyse", "check"]):
+            region_id = self._extract_region(message)
             result = self._dispatch_tool("analyze_flood_risk", {"region_id": region_id})
             tool_calls.append({"tool": "analyze_flood_risk", "result": result})
 
             risk_lvl = result.get("risk", {}).get("level", 0)
-            area = result.get("stats", {}).get("flooded_area_km2", 0)
+            area = result.get("stats", {}).get("flooded_area_km2", 0) or 0
             label = result.get("risk", {}).get("label", "Unknown")
             region_label = result.get("region_label", region_id)
-            text = (
-                f"**Flood Status — {region_label}**\n\n"
-                f"Risk Level: **{label}** (Level {risk_lvl}/4)\n"
-                f"Flooded Area: **{area:,.1f} km²**\n\n"
-                f"{RISK_EXPLANATIONS.get(risk_lvl, '')}"
-            )
+            if result.get("success"):
+                text = (
+                    f"**Flood Status — {region_label}**\n\n"
+                    f"Risk Level: **{label}** (Level {risk_lvl}/4)\n"
+                    f"Flooded Area: **{area:,.1f} km²**\n\n"
+                    f"{self._risk_explanation(risk_lvl)}"
+                )
+            else:
+                text = (f"**Flood Status — {region_label}**\n\n"
+                        f"Analysis unavailable: {result.get('message', 'unknown error')}")
 
-        elif any(w in msg_lower for w in ["alert", "warning", "active"]):
+        elif _has_word(msg_lower, ["alert", "alerts", "warning", "warnings", "active"]):
             result = self._dispatch_tool("list_active_alerts", {})
             tool_calls.append({"tool": "list_active_alerts", "result": result})
             alerts = result.get("alerts", [])
@@ -359,18 +425,27 @@ class AIAgent:
             else:
                 text = "No active flood alerts at this time."
 
-        elif any(w in msg_lower for w in ["recommend", "action", "do", "response"]):
-            region_id = self._extract_region(msg_lower)
+        elif _has_word(msg_lower, ["lga", "lgas"]) and ADMIN.resolve(message):
+            region = ADMIN.resolve(message)
+            state_id = region.state_id or region.id
+            result = self._dispatch_tool("list_lgas", {"state": state_id})
+            tool_calls.append({"tool": "list_lgas", "result": result})
+            names = [l["name"] for l in result.get("lgas", [])]
+            text = (f"**{result.get('state', state_id)}** has {len(names)} LGAs:\n\n"
+                    + ", ".join(names)) if names else "I couldn't find that state."
+
+        elif _has_word(msg_lower, ["recommend", "action", "actions", "do", "response"]):
+            region_id = self._extract_region(message)
             res = self._dispatch_tool("analyze_flood_risk", {"region_id": region_id})
             tool_calls.append({"tool": "analyze_flood_risk", "result": res})
             lvl = res.get("risk", {}).get("level", 0)
             actions = RECOMMENDED_ACTIONS.get(lvl, [])
             text = (
-                f"**Recommended Actions for {region_id.title()} (Level {lvl})**\n\n"
+                f"**Recommended Actions for {res.get('region_label', region_id)} (Level {lvl})**\n\n"
                 + "\n".join(f"• {a}" for a in actions)
             )
 
-        elif any(w in msg_lower for w in ["explain", "what", "mean", "level"]):
+        elif _has_word(msg_lower, ["explain", "what", "mean", "means", "level"]):
             # Extract risk level number from text
             lvl = 1
             for word in msg_lower.split():
@@ -381,20 +456,22 @@ class AIAgent:
             tool_calls.append({"tool": "explain_risk_level", "result": result})
             text = result.get("explanation", "")
 
-        elif any(w in msg_lower for w in ["hello", "hi", "hey", "help"]):
+        elif _has_word(msg_lower, ["hello", "hi", "hey", "help"]):
             text = (
                 "Hello! I'm **ANSA**, your AI assistant for ANSASphere.\n\n"
                 "I can help you:\n"
-                "• **Analyze flood risk** for any region — *'Check flood risk in Nigeria'*\n"
+                "• **Analyze flood risk** for Nigeria, a state or an LGA — *'Check flood risk in Kogi'*, *'Flood risk in Surulere, Lagos'*\n"
                 "• **List active alerts** — *'Show active alerts'*\n"
-                "• **Recommend actions** — *'What should we do in Kenya?'*\n"
+                "• **List a state's LGAs** — *'LGAs in Bayelsa'*\n"
+                "• **Recommend actions** — *'What should we do in Benue?'*\n"
                 "• **Explain risk levels** — *'Explain level 3'*\n\n"
                 "What would you like to know?"
             )
         else:
             text = (
-                "I can analyze flood risk, list alerts, and recommend emergency actions. "
-                "Try asking: *'What is the flood status in Bangladesh?'*"
+                "I can analyze flood risk, list alerts, and recommend emergency actions "
+                "for Nigeria, any state or any LGA. "
+                "Try asking: *'What is the flood status in Bayelsa?'*"
             )
 
         return {"response": text, "tool_calls": tool_calls, "engine": "rule-based"}
@@ -403,21 +480,39 @@ class AIAgent:
     # Tool dispatcher
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_region_arg(value: Optional[str]) -> Optional[str]:
+        region = ADMIN.get(value) or ADMIN.resolve(value)
+        return region.id if region else None
+
     def _dispatch_tool(self, name: str, args: Dict) -> Dict:
         try:
-            if name == "analyze_flood_risk":
-                return self.detector.analyze(
-                    region_id=args.get("region_id", "nigeria"),
-                    event_date=args.get("event_date"),
+            if name in ("analyze_flood_risk", "analyze_climate_layer"):
+                raw = args.get("region_id") or "nigeria"
+                region_id = self._resolve_region_arg(raw)
+                if region_id is None:
+                    return {"error": f"Unknown Nigerian region '{raw}'. Use a state or "
+                                     "LGA name, e.g. 'lagos' or 'lagos/surulere'."}
+                if name == "analyze_flood_risk":
+                    return self.detector.analyze(
+                        region_id=region_id,
+                        event_date=args.get("event_date"),
+                    )
+                if self.climate is None:
+                    return {"error": "Climate layer analyser not initialised."}
+                return self.climate.analyze(
+                    layer_id=args.get("layer_id", "vegetation"),
+                    region_id=region_id,
+                    date=args.get("date"),
                 )
             if name == "list_active_alerts":
                 return {"alerts": self.alerts.get_active()}
             if name == "explain_risk_level":
-                lvl = int(args.get("level", 0))
+                lvl = max(0, min(int(args.get("level", 0)), 4))
                 return {
                     "level": lvl,
-                    "label": ["None", "Watch", "Advisory", "Warning", "Emergency"][min(lvl, 4)],
-                    "explanation": RISK_EXPLANATIONS.get(lvl, "Unknown level."),
+                    "label": ["None", "Watch", "Advisory", "Warning", "Emergency"][lvl],
+                    "explanation": self._risk_explanation(lvl),
                 }
             if name == "recommend_action":
                 lvl = int(args.get("risk_level", 0))
@@ -427,58 +522,54 @@ class AIAgent:
                     "region": region,
                     "actions": RECOMMENDED_ACTIONS.get(lvl, []),
                 }
-            if name == "analyze_climate_layer":
-                if self.climate is None:
-                    return {"error": "Climate layer analyser not initialised."}
-                return self.climate.analyze(
-                    layer_id=args.get("layer_id", "vegetation"),
-                    region_id=args.get("region_id", "nigeria"),
-                    date=args.get("date"),
-                )
             if name == "list_climate_layers":
                 if self.climate is None:
                     return {"layers": []}
                 return {"layers": self.climate.list_layers()}
+            if name == "list_lgas":
+                region = ADMIN.get(args.get("state")) or ADMIN.resolve(args.get("state"))
+                if region is None or region.level == "country":
+                    return {"error": f"Unknown state '{args.get('state')}'."}
+                state = ADMIN.get(region.state_id) if region.level == "lga" else region
+                return {"state": state.label,
+                        "lgas": [{"id": l.id, "name": l.name} for l in ADMIN.lgas(state.id)]}
         except Exception as exc:
             logger.exception("Tool dispatch error (%s): %s", name, exc)
             return {"error": str(exc)}
         return {"error": f"Unknown tool: {name}"}
 
     def _extract_region(self, text: str) -> str:
-        """Very simple keyword → region_id mapping."""
-        from modules.flood_detector import KNOWN_REGIONS
-        for region_id in KNOWN_REGIONS:
-            if region_id in text:
-                return region_id
-        # Check for common variants
-        mapping = {
-            "west africa": "nigeria",
-            "east africa": "kenya",
-            "south asia": "bangladesh",
-        }
-        for phrase, rid in mapping.items():
-            if phrase in text:
-                return rid
-        return "nigeria"   # default
+        """Most specific Nigerian region named in *text*; defaults to the whole country."""
+        region = ADMIN.resolve(text)
+        return region.id if region else "nigeria"
 
     # ------------------------------------------------------------------
-    # Background monitor
+    # Monitor
     # ------------------------------------------------------------------
 
     def start_monitor(self, regions: Optional[List[str]] = None,
-                      interval: int = 3600):
+                      interval: int = 3600) -> bool:
+        """Start the background thread.  Returns False when threads aren't
+        allowed (PythonAnywhere) — use run_monitor.py as a scheduled task."""
         if regions:
-            self._monitored_regions = regions
+            valid = [r for r in regions if ADMIN.get(r)]
+            if valid:
+                self._monitored_regions = valid
+        if not self.threads_allowed:
+            return False
         self._monitor_running = True
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return True   # already running — the loop picks up the new regions
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
-            args=(interval,),
+            args=(max(60, interval),),
             daemon=True,
             name="ansa-monitor",
         )
         self._monitor_thread.start()
         logger.info("Background monitor started (interval=%ds, regions=%s)",
                     interval, self._monitored_regions)
+        return True
 
     def stop_monitor(self):
         self._monitor_running = False
@@ -486,29 +577,36 @@ class AIAgent:
     def _monitor_loop(self, interval: int):
         while self._monitor_running:
             try:
-                self._run_monitor_cycle()
+                self.run_monitor_cycle()
             except Exception as exc:
                 logger.error("Monitor cycle error: %s", exc)
-            time.sleep(interval)
+            # Sleep in short steps so stop_monitor() takes effect promptly
+            for _ in range(interval):
+                if not self._monitor_running:
+                    return
+                time.sleep(1)
 
-    def _run_monitor_cycle(self):
+    def run_monitor_cycle(self) -> List[Dict]:
+        """Run one flood check per monitored region; create alerts for risk ≥ 2."""
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        self._last_monitor_run = datetime.utcnow().isoformat()
+        summary = []
         for region_id in self._monitored_regions:
             try:
                 result = self.detector.analyze(region_id=region_id,
                                                event_date=today,
                                                use_cache=False)
                 risk = result.get("risk", {}).get("level", 0)
-                area = result.get("stats", {}).get("flooded_area_km2", 0)
+                area = result.get("stats", {}).get("flooded_area_km2", 0) or 0
+                summary.append({"region_id": region_id, "success": result.get("success"),
+                                "risk": risk, "message": result.get("message")})
 
-                if risk >= 2:
+                if result.get("success") and risk >= 2:
                     self.alerts.create(
                         region=result.get("region_label", region_id),
                         level=risk,
                         message=(
                             f"Automated detection: {area:,.0f} km² flooded "
-                            f"({result['stats'].get('flood_fraction_pct', 0):.1f}% of region). "
+                            f"({result['stats'].get('flood_fraction_pct', 0):.1f}% of area). "
                             f"Risk: {result['risk']['label']}."
                         ),
                         source="auto-monitor",
@@ -516,12 +614,16 @@ class AIAgent:
                     logger.info("Auto-alert created: %s level=%d", region_id, risk)
             except Exception as exc:
                 logger.warning("Monitor failed for %s: %s", region_id, exc)
+                summary.append({"region_id": region_id, "success": False, "message": str(exc)})
+        self.alerts.set_meta("monitor_last_run", datetime.utcnow().isoformat())
+        return summary
 
     @property
     def monitor_status(self) -> Dict:
         return {
             "running": self._monitor_running,
+            "mode": "thread" if self.threads_allowed else "scheduled-task",
             "regions": self._monitored_regions,
-            "last_run": self._last_monitor_run,
+            "last_run": self.alerts.get_meta("monitor_last_run"),
             "engine": f"openrouter/{self._model}" if self.has_ai else "rule-based",
         }

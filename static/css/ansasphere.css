@@ -769,6 +769,58 @@ a { color: var(--accent); text-decoration: none; }
 }
 .region-chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-glow); }
 
+/* ── Visitors tab ─────────────────────────────────────── */
+.visits-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.seg-control {
+  display: inline-flex;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 2px;
+}
+.seg-control button {
+  padding: 4px 12px;
+  font-size: 11px; color: var(--text-2);
+  border-radius: 4px;
+  transition: background .2s, color .2s;
+}
+.seg-control button:hover { color: var(--text-0); }
+.seg-control button.active { background: var(--accent-dim); color: var(--text-0); }
+.visits-range { font-size: 10px; color: var(--text-2); font-family: var(--mono); }
+
+.visits-summary { grid-template-columns: repeat(3, 1fr); margin-bottom: 12px; }
+.dmc-value.vis-top {
+  font-size: 15px; line-height: 24px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.visits-note {
+  margin-bottom: 12px; padding: 8px 10px;
+  border: 1px solid rgba(255, 190, 61, .35);
+  background: rgba(255, 190, 61, .08);
+  border-radius: var(--r-sm);
+  color: var(--warn); font-size: 11px;
+}
+.visits-chart-wrap { height: 140px; margin-bottom: 12px; }
+
+.visits-table th.num, .visits-table td.num { text-align: right; font-family: var(--mono); }
+.vis-rank { color: var(--text-2); width: 24px; }
+.cc-badge {
+  display: inline-block; min-width: 24px; margin-right: 8px;
+  padding: 1px 4px; border-radius: 3px;
+  background: var(--bg-3); color: var(--text-1);
+  font-family: var(--mono); font-size: 9px; text-align: center;
+}
+.share-cell { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+.share-bar { flex: 1; height: 6px; background: var(--bg-3); border-radius: 99px; overflow: hidden; }
+.share-bar span { display: block; height: 100%; background: var(--accent); border-radius: 99px; }
+.share-pct { font-family: var(--mono); font-size: 10px; color: var(--text-2); width: 40px; text-align: right; }
+.visits-foot { margin-top: 12px; font-size: 10px; color: var(--text-2); line-height: 1.5; }
+.visits-foot a { color: var(--accent); }
+
 /* ═══════════════════════════════════════════════════════════════
    SETTINGS
 ═══════════════════════════════════════════════════════════════ */
@@ -1052,6 +1104,30 @@ a { color: var(--accent); text-decoration: none; }
   transform: translateX(-50%);
   pointer-events: none;
 }
+/* Other states' names fade once a state is selected */
+.state-label.dim span { opacity: 0.35; }
+/* Selected LGA name */
+.lga-label span {
+  font-size: 11px;
+  color: #ffd166;
+  text-transform: none;
+}
+
+/* ── Hover names on state / LGA boundaries ────────────── */
+.leaflet-tooltip.boundary-tip {
+  background: var(--bg-glass);
+  border: 1px solid var(--border-hi);
+  color: var(--text-0);
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: var(--r-sm);
+  box-shadow: none;
+}
+.leaflet-tooltip.boundary-tip::before { display: none; }
+
+/* ── State / LGA pickers in window toolbars ──────────── */
+.win-select { max-width: 160px; }
+.win-select:disabled { opacity: 0.45; }
 
 /* Legend overlay */
 .climate-legend {
@@ -1180,7 +1256,11 @@ a { color: var(--accent); text-decoration: none; }
 .stat-yes { color: #ff7043; }
 .stat-no  { color: #66bb6a; }
 .cs-period .cs-key { color: var(--text-3, #555); }
-.cs-period .cs-val { color: var(--text-3, #555); font-weight: 400; }
+.cs-period .cs-val { color: var(--text-3, #555); font-weight: 400; white-space: normal; text-align: right; }
+/* Breakdown rows, e.g. land-cover class shares */
+.cs-sub { padding-left: 10px; }
+.cs-sub .cs-val { font-weight: 400; color: var(--text-1); }
+.region-chip small { color: var(--text-2); margin-left: 4px; font-size: 10px; }
 .no-data  { color: var(--text-2); font-size: 11px; }
 
 .climate-alert-box {

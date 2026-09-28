@@ -1,17 +1,13 @@
 /**
  * climate.js — ANSASphere Climate & Environment Monitor
  * Handles the 15-layer environmental analysis window.
- * Depends on: Leaflet (global L), desktop.js toast/helpers.
+ * Depends on: Leaflet (global L), desktop.js toast/apiJSON helpers,
+ *             nigeria_admin.js (State/LGA pickers + boundary overlay).
  *
- * Boundary system:
- *   - geoBoundaries API (free, CORS-enabled) provides ADM0 (country) +
- *     ADM1 (states/regions) GeoJSON for each country.
- *   - An inverse-mask polygon (world minus country) is painted over the
- *     basemap to hide everything outside the selected country.
- *   - State boundary lines are drawn inside the country.
- *   - Country outline is drawn with a bright accent stroke.
- *   - GEE climate tiles (.clip(aoi)) naturally clip to the bounding box;
- *     the visual mask hides any data that bleeds past the exact border.
+ * Region = Nigeria, one of its 37 states or one of its 774 LGAs.  The
+ * boundary overlay dims everything outside Nigeria, outlines the states
+ * and, once a state is selected, its LGAs; clicking the map selects a
+ * state/LGA.  GEE tiles are clipped server-side to the same GAUL polygon.
  */
 
 'use strict';
@@ -64,48 +60,17 @@ const LEGENDS = {
 };
 
 /* ══════════════════════════════════════════════════════════════
-   COUNTRY CONFIG  (ISO-3 codes + map centre + zoom)
-══════════════════════════════════════════════════════════════ */
-const ISO3_MAP = {
-  nigeria:    'NGA', ghana:      'GHA', kenya:      'KEN',
-  ethiopia:   'ETH', mozambique: 'MOZ', tanzania:   'TZA',
-  bangladesh: 'BGD', india:      'IND', pakistan:   'PAK',
-  myanmar:    'MMR', thailand:   'THA', indonesia:  'IDN',
-};
-
-const REGION_VIEW = {
-  nigeria:    { center: [9.0,   8.0],   zoom: 6 },
-  ghana:      { center: [7.9,  -1.0],   zoom: 7 },
-  kenya:      { center: [0.0,  38.0],   zoom: 6 },
-  ethiopia:   { center: [9.0,  40.0],   zoom: 6 },
-  mozambique: { center: [-18.0, 35.0],  zoom: 5 },
-  tanzania:   { center: [-6.4,  34.9],  zoom: 6 },
-  bangladesh: { center: [23.7,  90.4],  zoom: 7 },
-  india:      { center: [20.5,  79.0],  zoom: 5 },
-  pakistan:   { center: [30.0,  69.0],  zoom: 6 },
-  myanmar:    { center: [19.0,  96.5],  zoom: 6 },
-  thailand:   { center: [13.0, 101.5],  zoom: 6 },
-  indonesia:  { center: [-2.0, 118.0],  zoom: 5 },
-};
-
-/* ══════════════════════════════════════════════════════════════
    STATE
 ══════════════════════════════════════════════════════════════ */
 const _cs = {
   map:           null,
   tileLayer:     null,
-  maskLayer:     null,   // inverse-mask polygon (world minus country)
-  statesLayer:   null,   // ADM1 state/region outlines
-  labelsLayer:   null,   // ADM1 state name labels
-  countryLayer:  null,   // ADM0 country outline
+  boundaries:    null,   // NigeriaBoundaryLayer
+  pickers:       null,   // { regionId(), set(id) }
   selectedLayer: null,
-  currentRegion: null,   // which country boundaries are currently loaded
+  currentRegion: null,   // region of the last successful analysis
   isLoading:     false,
-  bdLoading:     false,  // true while fetching GeoJSON
 };
-
-// In-memory GeoJSON cache: { regionId: { adm0, adm1 } }
-const _geoCache = {};
 
 /* ══════════════════════════════════════════════════════════════
    INIT  (called once after desktop is ready)
@@ -193,9 +158,26 @@ function _initClimateMap() {
     attributionControl: false,
   });
 
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    subdomains: 'abcd', maxZoom: 19,
-  }).addTo(_cs.map);
+  addDarkBasemap(_cs.map);
+
+  _cs.boundaries = new NigeriaBoundaryLayer(_cs.map, regionId => {
+    _cs.pickers?.set(regionId);
+    _onRegionChange(regionId);
+  });
+  _cs.boundaries.show('nigeria');
+}
+
+function _currentRegionId() {
+  return _cs.pickers ? _cs.pickers.regionId() : 'nigeria';
+}
+
+/** New State/LGA selected: redraw boundaries and drop the old result. */
+function _onRegionChange(regionId) {
+  _cs.boundaries?.show(regionId);
+  _cs.currentRegion = null;
+  if (_cs.tileLayer) { _cs.map.removeLayer(_cs.tileLayer); _cs.tileLayer = null; }
+  _clearStats();
+  _hideAlertBox();
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -208,203 +190,12 @@ function _bindControls() {
   const btn = document.getElementById('run-climate-btn');
   if (btn) btn.addEventListener('click', runClimateAnalysis);
 
-  const regionSel = document.getElementById('climate-region-select');
-  if (regionSel) {
-    regionSel.addEventListener('change', () => {
-      _loadCountryBoundary(regionSel.value);
-    });
-    // Load default country boundary after a short delay to allow map to render
-    setTimeout(() => _loadCountryBoundary(regionSel.value), 200);
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════
-   COUNTRY BOUNDARY SYSTEM
-   Uses geoBoundaries API (free, CORS-enabled):
-     ADM0 = country outline
-     ADM1 = states / regions / provinces
-══════════════════════════════════════════════════════════════ */
-
-/**
- * Fetch and display ADM0 (country outline) + ADM1 (state lines) +
- * inverse mask (everything outside the country is darkened).
- */
-async function _loadCountryBoundary(regionId) {
-  if (!_cs.map || _cs.bdLoading) return;
-  _cs.bdLoading = true;
-
-  // Pan immediately to give instant feedback
-  const rv = REGION_VIEW[regionId];
-  if (rv) _cs.map.setView(rv.center, rv.zoom);
-
-  // Remove old layers
-  _clearBoundaries();
-
-  const iso3 = ISO3_MAP[regionId];
-  if (!iso3) { _cs.bdLoading = false; return; }
-
-  try {
-    // Use cache if available
-    if (!_geoCache[regionId]) {
-      // Use the GEE-backed boundary endpoint (FAO/GAUL_SIMPLIFIED_500m/2015)
-      // instead of the external geoBoundaries.org API.  This avoids an
-      // unreliable third-party dependency and GitHub CORS / LFS issues.
-      const [adm0, adm1] = await Promise.all([
-        fetch(`/api/geo/boundary?iso3=${iso3}&level=ADM0`).then(r => r.json()),
-        fetch(`/api/geo/boundary?iso3=${iso3}&level=ADM1`).then(r => r.json()),
-      ]);
-
-      if (!adm0.features?.length) throw new Error('No ADM0 boundary returned');
-      _geoCache[regionId] = { adm0, adm1 };
-    }
-
-    _applyBoundaries(regionId, _geoCache[regionId]);
-
-  } catch (err) {
-    console.warn('[ClimateMonitor] Boundary load failed for', regionId, err);
-    // Non-fatal: map still works, just without boundary overlay
-  } finally {
-    _cs.bdLoading = false;
-  }
-}
-
-/** Remove all boundary layers from the map. */
-function _clearBoundaries() {
-  if (_cs.maskLayer)    { _cs.map.removeLayer(_cs.maskLayer);    _cs.maskLayer    = null; }
-  if (_cs.statesLayer)  { _cs.map.removeLayer(_cs.statesLayer);  _cs.statesLayer  = null; }
-  if (_cs.labelsLayer)  { _cs.map.removeLayer(_cs.labelsLayer);  _cs.labelsLayer  = null; }
-  if (_cs.countryLayer) { _cs.map.removeLayer(_cs.countryLayer); _cs.countryLayer = null; }
-}
-
-/**
- * Add mask + state + country layers to the map.
- * Layer order within Leaflet's overlayPane (SVG) matters:
- *   mask (bottom) → states → country outline (top)
- * Tile layers always sit BELOW the overlayPane, so climate tiles are
- * naturally under the mask (which has a transparent hole over the country).
- */
-function _applyBoundaries(regionId, { adm0, adm1 }) {
-  if (!_cs.map) return;
-  _cs.currentRegion = regionId;
-
-  // 1 ── Inverse mask ─────────────────────────────────────────
-  //   A polygon that covers the entire world, with the country
-  //   polygon cut out as a hole. fillRule:'evenodd' makes the hole
-  //   transparent so the map and climate tile show through there.
-  const maskFeature = _buildInverseMask(adm0);
-  if (maskFeature) {
-    _cs.maskLayer = L.geoJSON(maskFeature, {
-      style: {
-        fillColor:   '#000000',
-        fillOpacity: 0.68,
-        fillRule:    'evenodd',
-        color:       'transparent',
-        weight:      0,
-      },
-      interactive: false,
-    }).addTo(_cs.map);
-  }
-
-  // 2 ── State / region internal boundaries (ADM1) ────────────
-  _cs.statesLayer = L.geoJSON(adm1, {
-    style: {
-      color:      '#26c6da',
-      weight:     0.9,
-      opacity:    0.55,
-      fill:       false,
-      dashArray:  '5 3',
-    },
-    interactive: false,
-  }).addTo(_cs.map);
-  // 2b ── State name labels at centroid of each ADM1 polygon ────────────
-  const _labelMarkers = [];
-  (adm1.features || []).forEach(feat => {
-    const name = feat.properties?.shapeName
-               || feat.properties?.NAME_1
-               || feat.properties?.ADM1_NAME
-               || feat.properties?.name
-               || feat.properties?.ADM1_EN
-               || '';
-    if (!name) return;
-    try {
-      const bounds = L.geoJSON(feat).getBounds();
-      if (!bounds.isValid()) return;
-      _labelMarkers.push(L.marker(bounds.getCenter(), {
-        icon: L.divIcon({
-          className: 'state-label',
-          html: `<span>${name}</span>`,
-          iconSize: [1, 1],
-          iconAnchor: [0, 0],
-        }),
-        interactive: false,
-        keyboard: false,
-      }));
-    } catch (_) {}
-  });
-  if (_labelMarkers.length) {
-    _cs.labelsLayer = L.layerGroup(_labelMarkers).addTo(_cs.map);
-  }
-  // 3 ── Country outer boundary (ADM0) ─── bright, solid ──────
-  _cs.countryLayer = L.geoJSON(adm0, {
-    style: {
-      color:   '#00e5ff',
-      weight:  2.5,
-      opacity: 0.95,
-      fill:    false,
-    },
-    interactive: false,
-  }).addTo(_cs.map);
-
-  // Fit map to exact country extent
-  try {
-    const bounds = L.geoJSON(adm0).getBounds();
-    if (bounds.isValid()) {
-      _cs.map.fitBounds(bounds, { padding: [28, 28], maxZoom: 8 });
-    }
-  } catch (_) {}
-}
-
-/**
- * Build a GeoJSON Feature whose geometry is the entire world minus
- * the country polygon.  Using fillRule:'evenodd' in Leaflet makes
- * the country interior transparent (shows through as a "window").
- *
- * Works for both Polygon and MultiPolygon country shapes.
- */
-function _buildInverseMask(adm0GeoJSON) {
-  // World bounding ring (GeoJSON = [lon, lat])
-  const worldRing = [
-    [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90],
-  ];
-
-  try {
-    const features = adm0GeoJSON.features || [adm0GeoJSON];
-    const geom = features[0].geometry;
-
-    let holes = [];
-    if (geom.type === 'Polygon') {
-      // Take only the outer ring (index 0) — ignore any existing holes
-      holes = [geom.coordinates[0]];
-    } else if (geom.type === 'MultiPolygon') {
-      // Take the outer ring of each sub-polygon (ignores interior holes)
-      holes = geom.coordinates.map(part => part[0]);
-    }
-
-    if (!holes.length) return null;
-
-    return {
-      type: 'Feature',
-      properties: {},
-      geometry: {
-        type: 'Polygon',
-        // First element = world outer ring; remaining = country holes
-        coordinates: [worldRing, ...holes],
-      },
-    };
-  } catch (e) {
-    console.warn('[ClimateMonitor] _buildInverseMask error:', e);
-    return null;
-  }
+  NigeriaAdmin.bindPickers(
+    document.getElementById('climate-state-select'),
+    document.getElementById('climate-lga-select'),
+    _onRegionChange,
+  ).then(p => { _cs.pickers = p; })
+   .catch(err => _climateToast(`Could not load state/LGA list: ${err.message}`, 'warning'));
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -417,25 +208,21 @@ async function runClimateAnalysis() {
     return;
   }
 
-  const regionId = (document.getElementById('climate-region-select') || {}).value || 'nigeria';
-  const date     = (document.getElementById('climate-date-input')    || {}).value || '';
+  const regionId = _currentRegionId();
+  const date     = (document.getElementById('climate-date-input') || {}).value || '';
+  const region   = NigeriaAdmin.region(regionId);
 
-  _setLoading(true, `Analyzing ${_cs.selectedLayer}…`);
+  _setLoading(true, `Analyzing ${_cs.selectedLayer} · ${region ? region.label : regionId}…`);
   _clearStats();
   _hideAlertBox();
-
-  // Abort the fetch after 2 minutes so the spinner never hangs forever.
-  const controller  = new AbortController();
-  const _abortTimer = setTimeout(() => controller.abort(), 120_000);
 
   try {
     const params = new URLSearchParams({ layer_id: _cs.selectedLayer, region_id: regionId });
     if (date) params.set('date', date);
 
-    const res = await fetch(`/api/climate/analyze?${params}`, { signal: controller.signal });
-    clearTimeout(_abortTimer);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
+    // apiJSON aborts after 3 min and turns PythonAnywhere's HTML 502/504
+    // pages into readable errors, so the spinner never hangs forever.
+    const json = await apiJSON(`/api/climate/analyze?${params}`);
     const result = json.result || {};
 
     if (!result.success) {
@@ -444,14 +231,12 @@ async function runClimateAnalysis() {
       return;
     }
 
-    // Record the active region synchronously so the trend panel can read it
-    // immediately — _applyBoundaries sets it too, but that runs async (after
-    // the GeoJSON download) and can still be null when the user opens the panel.
+    // Region the trend panel should chart
     _cs.currentRegion = regionId;
 
     // Add tile layer to map
     if (result.tile_url) {
-      _addTileLayer(result.tile_url, regionId);
+      _addTileLayer(result.tile_url);
     }
 
     _showStats(result.stats || {});
@@ -464,10 +249,7 @@ async function runClimateAnalysis() {
     if (trendBtn) trendBtn.style.display = '';
 
   } catch (err) {
-    clearTimeout(_abortTimer);
-    const msg = err.name === 'AbortError'
-      ? 'Analysis timed out (>2 min). Try a different date or region.'
-      : (err.message || String(err));
+    const msg = err.message || String(err);
     _climateToast(msg, 'error');
     _showStats({ error: msg });
   } finally {
@@ -478,7 +260,7 @@ async function runClimateAnalysis() {
 /* ══════════════════════════════════════════════════════════════
    MAP HELPERS
 ══════════════════════════════════════════════════════════════ */
-function _addTileLayer(url, regionId) {
+function _addTileLayer(url) {
   if (!_cs.map) return;
 
   // Remove previous climate tile
@@ -487,33 +269,9 @@ function _addTileLayer(url, regionId) {
     _cs.tileLayer = null;
   }
 
-  // Add new climate tile (goes to tilePane, always below overlayPane GeoJSON)
+  // Tiles go to the tilePane, which is always below the boundary vectors
+  // in the overlayPane, so no re-stacking is needed.
   _cs.tileLayer = L.tileLayer(url, { opacity: 0.85, maxZoom: 18 }).addTo(_cs.map);
-
-  // Load/refresh boundary for the region if not already loaded
-  if (_cs.currentRegion !== regionId) {
-    _loadCountryBoundary(regionId);
-  } else {
-    // Bring boundary layers above the newly-added tile layer
-    // (Within the overlayPane they are already above all tile layers,
-    // but re-adding ensures correct SVG stacking order inside the pane)
-    _bringBoundariesToFront();
-  }
-}
-
-/**
- * Ensure mask → states → country are stacked above everything else
- * in the SVG overlayPane after the climate tile is added.
- */
-function _bringBoundariesToFront() {
-  // Leaflet's GeoJSON layers are already in the overlayPane (above tiles),
-  // but within the SVG we re-insert them to maintain correct draw order.
-  if (_cs.maskLayer)    _cs.maskLayer.bringToFront();
-  if (_cs.statesLayer)  _cs.statesLayer.bringToFront();
-  if (_cs.countryLayer) _cs.countryLayer.bringToFront();
-  // _cs.labelsLayer is L.layerGroup of L.Marker (divIcon) — markers live in
-  // Leaflet's markerPane (z-index 600) which is always above the overlayPane
-  // (z-index 400), so no bringToFront() call is needed or available.
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -528,20 +286,35 @@ function _showStats(stats) {
   }
 
   const skipKeys = new Set(['region', 'period', 'year', 'error']);
-  const rows = Object.entries(stats)
+  const row = (label, value, cls = '') =>
+    `<div class="cs-row ${cls}"><span class="cs-key">${esc(label)}</span><strong class="cs-val">${value}</strong></div>`;
+  const rows = [];
+  Object.entries(stats)
     .filter(([k]) => !skipKeys.has(k))
-    .map(([k, v]) => {
+    .forEach(([k, v]) => {
       const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      if (v && typeof v === 'object') {
+        // e.g. land-cover class counts → share of the area per class
+        const entries = Object.entries(v).filter(([, n]) => typeof n === 'number');
+        const total = entries.reduce((sum, [, n]) => sum + n, 0) || 1;
+        rows.push(row(label, ''));
+        entries.sort((a, b) => b[1] - a[1]).forEach(([name, n]) =>
+          rows.push(row(name, `${(n / total * 100).toFixed(1)}%`, 'cs-sub')));
+        return;
+      }
       const value = typeof v === 'boolean'
         ? (v ? '<span class="stat-yes">Yes ⚠</span>' : '<span class="stat-no">No</span>')
-        : (typeof v === 'number' ? v.toFixed(3) : v);
-      return `<div class="cs-row"><span class="cs-key">${label}</span><strong class="cs-val">${value}</strong></div>`;
+        : (typeof v === 'number'
+            ? v.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v) >= 100 ? 1 : 3 })
+            : esc(v ?? '—'));
+      rows.push(row(label, value));
     });
 
   // Extra info rows
-  if (stats.region) rows.unshift(`<div class="cs-row"><span class="cs-key">Region</span><strong class="cs-val">${stats.region}</strong></div>`);
-  if (stats.period) rows.push(`<div class="cs-row cs-period"><span class="cs-key">Period</span><strong class="cs-val">${stats.period}</strong></div>`);
-  if (stats.year)   rows.push(`<div class="cs-row cs-period"><span class="cs-key">Year</span><strong class="cs-val">${stats.year}</strong></div>`);
+  if (stats.region) rows.unshift(row('Region', esc(stats.region)));
+  if (stats.period) rows.push(row('Period', esc(stats.period), 'cs-period'));
+  if (stats.year)   rows.push(row('Year', esc(stats.year), 'cs-period'));
+  if (stats.error)  rows.push(row('Error', esc(stats.error)));
 
   grid.innerHTML = rows.join('');
 }
@@ -693,9 +466,7 @@ function toggleTrendPanel(forceClose) {
 
 /** Load trend data only if not already loaded for this layer+region combo. */
 function _ensureTrendLoaded() {
-  const regionId = _cs.currentRegion
-    || (document.getElementById('climate-region-select') || {}).value
-    || '';
+  const regionId = _cs.currentRegion || _currentRegionId();
   if (!_cs.selectedLayer || !regionId) return;
   const canvas = document.getElementById('climate-trend-canvas');
   if (!canvas) return;
@@ -715,9 +486,7 @@ async function _loadTrend(layerId, regionId, date) {
     const params = new URLSearchParams({ layer_id: layerId, region_id: regionId });
     if (date) params.set('date', date);
 
-    const res  = await fetch(`/api/climate/trend?${params}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
+    const json = await apiJSON(`/api/climate/trend?${params}`);
     const data = json.result || {};
 
     if (!data.success) {

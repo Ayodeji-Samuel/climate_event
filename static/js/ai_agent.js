@@ -182,6 +182,12 @@ function summariseTool(name, result) {
       return `Level ${result.level} — ${result.label}`;
     case 'recommend_action':
       return `${(result.actions || []).length} recommendations for Level ${result.risk_level}`;
+    case 'list_lgas':
+      return `${(result.lgas || []).length} LGAs in ${result.state || ''}`;
+    case 'analyze_climate_layer':
+      return result.success
+        ? `${result.meta?.label || result.layer_id} — ${result.stats?.region || result.region_id}`
+        : `Unavailable: ${result.message || 'no data'}`;
     default:
       return JSON.stringify(result).substring(0, 80);
   }
@@ -235,10 +241,10 @@ async function loadAIStatus() {
     const badge  = document.getElementById('ai-engine-badge');
     if (badge) badge.textContent = engine;
 
-    // Teal for gemini, muted for rule-based
+    // Teal for the OpenRouter LLM, muted for rule-based
     const dot = document.getElementById('ai-dot');
     if (dot) dot.style.background =
-      engine.includes('gemini') ? 'var(--teal)' : 'var(--accent)';
+      engine.startsWith('openrouter') ? 'var(--teal)' : 'var(--accent)';
   } catch {}
 }
 

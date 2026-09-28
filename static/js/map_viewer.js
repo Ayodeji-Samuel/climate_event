@@ -1,8 +1,10 @@
 /**
  * map_viewer.js — Leaflet map + GEE tile management
  * Initialises a Leaflet map in #flood-map using CartoDB DarkMatter.
- * Flood analysis is triggered by the "Analyze" button; results are
- * visualised as GEE tile overlays.
+ * Region = Nigeria, a state or an LGA, chosen with the State/LGA pickers
+ * or by clicking the map (see nigeria_admin.js).  Flood analysis is
+ * triggered by the "Analyze" button; results are visualised as GEE tile
+ * overlays clipped to the selected boundary.
  */
 
 'use strict';
@@ -12,6 +14,8 @@ let _floodLayer   = null;
 let _sarLayer     = null;
 let _waterLayer   = null;
 let _analysisData = null;
+let _boundaries   = null;   // NigeriaBoundaryLayer
+let _pickers      = null;   // { regionId(), set(id) }
 
 /* ══════════════════════════════════════════════════════════════
    INIT
@@ -21,27 +25,22 @@ function initMap() {
 
   _map = L.map('flood-map', {
     center: [9.0820, 8.6753],   // Nigeria centre
-    zoom: 5,
+    zoom: 6,
     zoomControl: true,
     attributionControl: true,
   });
 
-  // Register invalidateMap so desktop.js can call it when the window is revealed
-  if (window.ANSA) window.ANSA.invalidateMap = () => _map?.invalidateSize();
-  else window.addEventListener('load', () => {
-    if (window.ANSA) window.ANSA.invalidateMap = () => _map?.invalidateSize();
-  });
+  // Register helpers so desktop.js can reach the flood map
+  const expose = () => {
+    window.ANSA.invalidateMap    = () => _map?.invalidateSize();
+    window.ANSA.selectFloodRegion = selectRegion;
+    window.ANSA.floodRegion      = () => NigeriaAdmin.region(currentRegionId());
+  };
+  if (window.ANSA) expose();
+  else window.addEventListener('load', () => window.ANSA && expose());
 
-  // ── Dark base layer ──────────────────────────────────────────
-  L.tileLayer(
-    'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    {
-      attribution:
-        '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-      subdomains: 'abcd',
-      maxZoom: 19,
-    }
-  ).addTo(_map);
+  // ── Dark base layer + labels ─────────────────────────────────
+  addDarkBasemap(_map);
 
   // Satellite layer (alternate, not added by default)
   window._satLayer = L.tileLayer(
@@ -49,7 +48,36 @@ function initMap() {
     { attribution: 'ESRI', maxZoom: 19 }
   );
 
+  // ── Nigeria boundaries + State/LGA pickers ───────────────────
+  _boundaries = new NigeriaBoundaryLayer(_map, selectRegion);
+  _boundaries.show('nigeria');
+  NigeriaAdmin.bindPickers(
+    document.getElementById('flood-state-select'),
+    document.getElementById('flood-lga-select'),
+    onRegionChange,
+  ).then(p => { _pickers = p; })
+   .catch(err => {
+     console.warn('Region list failed to load:', err);
+     window.ANSA?.showToast('Boundaries', 'Could not load state/LGA list', 'warning');
+   });
+
   bindMapControls();
+}
+
+function currentRegionId() {
+  return _pickers ? _pickers.regionId() : 'nigeria';
+}
+
+/** Programmatic selection (map click, region chip, alert link). */
+function selectRegion(regionId) {
+  _pickers?.set(regionId);
+  onRegionChange(regionId);
+}
+
+function onRegionChange(regionId) {
+  _boundaries?.show(regionId);
+  clearResult();
+  if (document.getElementById('layer-water')?.checked) loadWaterLayer();
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -58,11 +86,6 @@ function initMap() {
 function bindMapControls() {
   // Run analysis button
   document.getElementById('run-flood-btn')?.addEventListener('click', runAnalysis);
-
-  // Region select → re-centre map
-  document.getElementById('flood-region-select')?.addEventListener('change', e => {
-    flyToRegion(e.target.value);
-  });
 
   // Layer toggles
   document.getElementById('layer-flood')?.addEventListener('change', e => {
@@ -85,55 +108,19 @@ function bindMapControls() {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   REGION BOUNDING BOXES (must match flood_detector.py)
-══════════════════════════════════════════════════════════════ */
-const REGION_BOUNDS = {
-  nigeria:     [[4.24,   2.68],  [13.89,  14.68]],
-  ghana:       [[4.74,  -3.26],  [11.17,   1.19]],
-  kenya:       [[-4.72, 33.91], [ 4.62,  41.90]],
-  ethiopia:    [[3.40,  32.99],  [14.89,  47.98]],
-  mozambique:  [[-26.86, 30.22], [-10.47, 40.84]],
-  tanzania:    [[-11.75, 29.34], [ -0.99, 40.44]],
-  bangladesh:  [[20.67, 88.01],  [26.63,  92.67]],
-  india:       [[6.75,  68.16],  [35.50,  97.40]],
-  pakistan:    [[23.69, 60.87],  [37.10,  77.84]],
-  myanmar:     [[9.78,  92.19],  [28.53, 101.17]],
-  thailand:    [[5.61,  97.34],  [20.47, 105.64]],
-  indonesia:   [[-10.36, 95.01], [ 5.48, 141.02]],
-};
-
-function flyToRegion(regionId) {
-  if (!_map) return;
-  const bounds = REGION_BOUNDS[regionId];
-  if (bounds) {
-    _map.fitBounds(bounds, { padding: [20, 20], animate: true, duration: 0.8 });
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════
    FLOOD ANALYSIS
 ══════════════════════════════════════════════════════════════ */
 async function runAnalysis() {
-  const regionId = document.getElementById('flood-region-select')?.value;
+  const regionId = currentRegionId();
   const date     = document.getElementById('flood-date-input')?.value ||
                    new Date().toISOString().split('T')[0];
 
-  if (!regionId) {
-    window.ANSA?.showToast('Error', 'Please select a region', 'error');
-    return;
-  }
-
   setLoadingState(true);
-  flyToRegion(regionId);
+  _boundaries?.fit(regionId);
 
   try {
-    const url = `/api/flood/analyze?region_id=${encodeURIComponent(regionId)}&date=${date}`;
-    const res  = await fetch(url);
-    const data = await res.json();
-
-    if (data.status !== 'ok') {
-      throw new Error(data.message || 'API error');
-    }
+    const params = new URLSearchParams({ region_id: regionId, date });
+    const data = await apiJSON(`/api/flood/analyze?${params}`);
 
     _analysisData = data.result;
     displayResult(_analysisData);
@@ -163,10 +150,28 @@ async function runAnalysis() {
 /* ══════════════════════════════════════════════════════════════
    DISPLAY RESULT
 ══════════════════════════════════════════════════════════════ */
-function displayResult(result) {
-  // ── Remove old layers ────────────────────────────────────────
+function removeResultLayers() {
   if (_floodLayer) { _map.removeLayer(_floodLayer); _floodLayer = null; }
   if (_sarLayer)   { _map.removeLayer(_sarLayer);   _sarLayer   = null; }
+}
+
+/** Reset map overlays + sidebar when the region changes. */
+function clearResult() {
+  removeResultLayers();
+  _analysisData = null;
+  ['stat-flooded', 'stat-total', 'stat-pct', 'stat-images', 'stat-updated']
+    .forEach(id => updateStat(id, '—'));
+  const badge = document.getElementById('risk-badge');
+  if (badge) { badge.textContent = '—'; badge.style.color = ''; }
+  const detail = document.getElementById('risk-detail');
+  if (detail) detail.textContent = 'Run analysis to view';
+  const alertBtn = document.getElementById('flood-alert-btn');
+  if (alertBtn) alertBtn.style.display = 'none';
+}
+
+function displayResult(result) {
+  // ── Remove old layers ────────────────────────────────────────
+  removeResultLayers();
 
   // ── Add new GEE tile layers ──────────────────────────────────
   if (result.flood_tile_url) {
@@ -209,7 +214,9 @@ function displayResult(result) {
     badge.style.color  = r.color || 'var(--accent)';
   }
   if (detail) {
-    detail.textContent = riskDescription(r.level || 0);
+    detail.textContent = result.success
+      ? `${result.region_label}: ${riskDescription(r.level || 0)}`
+      : (result.message || '—');
   }
 
   // ── Success toast ────────────────────────────────────────────
@@ -238,10 +245,10 @@ function displayNoData() {
    PERMANENT WATER LAYER
 ══════════════════════════════════════════════════════════════ */
 async function loadWaterLayer() {
-  const regionId = document.getElementById('flood-region-select')?.value || 'nigeria';
+  const regionId = currentRegionId();
   try {
-    const res  = await fetch(`/api/flood/water-layer?region_id=${encodeURIComponent(regionId)}`);
-    const data = await res.json();
+    const data = await apiJSON(`/api/flood/water-layer?region_id=${encodeURIComponent(regionId)}`);
+    if (regionId !== currentRegionId()) return;   // region changed meanwhile
     if (data.tile_url) {
       if (_waterLayer) _map.removeLayer(_waterLayer);
       _waterLayer = L.tileLayer(data.tile_url, {
@@ -287,7 +294,7 @@ function riskDescription(level) {
     'Watch: Minor flooding possible in low-lying areas.',
     'Advisory: Moderate flooding likely. Prepare emergency kits.',
     'Warning: Significant flooding underway. Evacuate low-lying areas.',
-    'Emergency: Catastrophic flooding. Immediate evacuation required.',
+    'Emergency: Severe flooding. Immediate evacuation required.',
   ][Math.min(level, 4)] || '—';
 }
 

@@ -105,9 +105,13 @@ class GEEEngine:
     Handles auth, keeps connection health, exposes helper methods.
     """
 
-    def __init__(self, credentials_path: str, project: str):
+    def __init__(self, credentials_path: str, project: str, deadline_ms: int = 0):
         self.credentials_path = credentials_path
         self.project = project
+        # Per-request EE timeout.  PythonAnywhere kills any web request that
+        # runs past 300 s; a deadline makes a slow computation fail with a
+        # clean JSON error instead of a killed worker and a bare 502.
+        self.deadline_ms = deadline_ms
         self.cache = GEECache()
         self._connected = False
         self._ee = None          # the `ee` module – lazy import
@@ -129,6 +133,8 @@ class GEEEngine:
                 self.credentials_path, scopes=scopes
             )
             ee.Initialize(credentials=creds, project=self.project)
+            if self.deadline_ms:
+                ee.data.setDeadline(self.deadline_ms)
             self._ee = ee
             self._connected = True
             self._init_error = None
@@ -193,25 +199,6 @@ class GEEEngine:
     # Region helpers
     # ------------------------------------------------------------------
 
-    def get_country_geometry(self, country_name: str):
-        """Return country boundary geometry from LSIB."""
-        ee = self._ee
-        fc = (
-            ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
-            .filter(ee.Filter.eq("country_na", country_name))
-        )
-        return fc.geometry()
-
-    def get_admin1_geometry(self, country_name: str, admin1_name: str):
-        """Return first-level admin boundary."""
-        ee = self._ee
-        fc = (
-            ee.FeatureCollection("FAO/GAUL/2015/level1")
-            .filter(ee.Filter.eq("ADM0_NAME", country_name))
-            .filter(ee.Filter.eq("ADM1_NAME", admin1_name))
-        )
-        return fc.geometry()
-
     def bbox_geometry(self, west: float, south: float,
                       east: float, north: float):
         """Create a rectangle geometry from bounding box coords."""
@@ -275,11 +262,12 @@ class GEEEngine:
             logger.warning("area computation failed: %s", exc)
             return 0.0
 
-    def compute_region_area_km2(self, geometry, scale: int = 1000) -> float:
+    def compute_region_area_km2(self, geometry) -> float:
         """Total area of a geometry in km²."""
-        ee = self._ee
         try:
-            area = geometry.area(maxError=1).getInfo()
+            # maxError=1 m forced exact geodesic maths on every vertex of a
+            # country-sized polygon; 100 m is still < 0.01 % error.
+            area = geometry.area(maxError=100).getInfo()
             return round(area / 1e6, 2)
         except Exception as exc:
             logger.warning("region area failed: %s", exc)

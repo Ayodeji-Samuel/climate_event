@@ -7,7 +7,9 @@ import logging.handlers
 import os
 import pathlib
 from dotenv import load_dotenv
-load_dotenv()  # must run before config.py reads os.environ
+# Must run before config.py reads os.environ.  Explicit path so it works
+# whatever the current directory is (PythonAnywhere, scheduled tasks).
+load_dotenv(pathlib.Path(__file__).resolve().parent / ".env")
 from flask import Flask, render_template
 from flask_cors import CORS
 
@@ -17,6 +19,7 @@ from modules.flood_detector import FloodDetector
 from modules.climate_layers import ClimateLayerAnalyzer
 from modules.ai_agent import AIAgent
 from modules.alert_system import AlertSystem
+from modules.visit_tracker import VisitTracker
 from api.routes import api_bp
 
 def _configure_logging():
@@ -65,6 +68,7 @@ def create_app(env: str = "default") -> Flask:
     gee = GEEEngine(
         credentials_path=app.config["GEE_CREDENTIALS_PATH"],
         project=app.config["GEE_PROJECT"],
+        deadline_ms=app.config["GEE_DEADLINE_MS"],
     )
     app.gee = gee
 
@@ -76,6 +80,12 @@ def create_app(env: str = "default") -> Flask:
     alert_system = AlertSystem()
     app.alert_system = alert_system
 
+    app.visit_tracker = VisitTracker(
+        db_path=app.config["VISITS_DB_PATH"],
+        geoip_path=app.config["GEOIP_DB_PATH"],
+        utc_offset_hours=app.config["VISITS_UTC_OFFSET_HOURS"],
+    )
+
     climate = ClimateLayerAnalyzer(gee)
     app.climate_layers = climate
 
@@ -85,6 +95,8 @@ def create_app(env: str = "default") -> Flask:
         climate_layers=climate,
         openrouter_api_key=app.config.get("OPENROUTER_API_KEY", ""),
         openrouter_model=app.config.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        monitored_regions=app.config["MONITOR_REGIONS"],
+        threads_allowed=app.config["MONITOR_THREADS_ALLOWED"],
     )
     app.ai_agent = agent
 
@@ -96,15 +108,21 @@ def create_app(env: str = "default") -> Flask:
     def index():
         return render_template("index.html")
 
-    # ── Background monitor (non-blocking) ────────────────────────────
-    monitor_interval = app.config.get("MONITOR_INTERVAL", 3600)
-    agent.start_monitor(interval=monitor_interval)
+    # ── Background monitor ───────────────────────────────────────────
+    # Off by default: every WSGI worker would otherwise start its own copy,
+    # and PythonAnywhere doesn't run threads in web apps at all (use
+    # run_monitor.py as a scheduled task there).
+    if app.config["MONITOR_AUTOSTART"]:
+        agent.start_monitor(interval=app.config["MONITOR_INTERVAL"])
     logger.info("ANSASphere started. GEE connected: %s", gee.is_connected)
 
     return app
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
+# Built exactly once per process.  wsgi.py (and any PythonAnywhere WSGI file
+# doing `from app import app as application`) reuses this instance — calling
+# create_app() again there doubled every GEE init and monitor thread.
 env = os.environ.get("FLASK_ENV", "development")
 app = create_app(env)
 

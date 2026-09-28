@@ -15,7 +15,7 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
   <!-- ANSASphere styles -->
-  <link rel="stylesheet" href="/static/css/ansasphere.css" />
+  <link rel="stylesheet" href="/static/css/ansasphere.css?v=1.2.0" />
 </head>
 <body>
 
@@ -136,8 +136,11 @@
           Flood Monitor
         </span>
         <div class="win-toolbar">
-          <select id="flood-region-select" class="win-select">
-            <option value="">Loading regions…</option>
+          <select id="flood-state-select" class="win-select" title="State">
+            <option value="nigeria">Loading states…</option>
+          </select>
+          <select id="flood-lga-select" class="win-select" title="Local Government Area" disabled>
+            <option value="">All LGAs</option>
           </select>
           <input type="date" id="flood-date-input" class="win-date-input" />
           <button class="win-action-btn" id="run-flood-btn">
@@ -211,15 +214,17 @@
             <div class="msg-avatar">A</div>
             <div class="msg-bubble">
               <p>Hello! I'm <strong>ANSA</strong>, your environmental intelligence assistant.</p>
-              <p>I can analyze real-time flood data from Sentinel-1 satellite imagery, assess risk levels, and recommend response actions.</p>
-              <p>Try: <em>"What is the flood risk in Nigeria right now?"</em></p>
+              <p>I can analyze real-time flood data from Sentinel-1 satellite imagery for Nigeria, any state or any LGA, assess risk levels, and recommend response actions.</p>
+              <p>Try: <em>"What is the flood risk in Kogi?"</em> or <em>"Flood risk in Surulere, Lagos"</em></p>
             </div>
           </div>
         </div>
         <div class="chat-input-area">
           <div class="quick-actions" id="quick-actions">
             <button class="quick-btn" data-msg="Check flood risk in Nigeria">Nigeria</button>
-            <button class="quick-btn" data-msg="Check flood risk in Bangladesh">Bangladesh</button>
+            <button class="quick-btn" data-msg="Check flood risk in Kogi">Kogi</button>
+            <button class="quick-btn" data-msg="Check flood risk in Bayelsa">Bayelsa</button>
+            <button class="quick-btn" data-msg="List the LGAs in Lagos">Lagos LGAs</button>
             <button class="quick-btn" data-msg="Show active alerts">Alerts</button>
             <button class="quick-btn" data-msg="Recommend actions for level 3 flood">Actions</button>
           </div>
@@ -290,6 +295,7 @@
           <button class="data-tab active" data-tab="overview">Overview</button>
           <button class="data-tab" data-tab="history">History</button>
           <button class="data-tab" data-tab="regions">Regions</button>
+          <button class="data-tab" data-tab="visitors">Visitors</button>
         </div>
         <div class="data-content" id="data-content">
           <div class="data-panel active" id="tab-overview">
@@ -326,6 +332,43 @@
           </div>
           <div class="data-panel" id="tab-regions">
             <div class="regions-grid" id="regions-grid">Loading…</div>
+          </div>
+          <div class="data-panel" id="tab-visitors">
+            <div class="visits-toolbar">
+              <div class="seg-control" id="visits-period" role="group" aria-label="Period">
+                <button data-period="day" class="active" aria-pressed="true">Daily</button>
+                <button data-period="week" aria-pressed="false">Weekly</button>
+                <button data-period="month" aria-pressed="false">Monthly</button>
+                <button data-period="all" aria-pressed="false">Overall</button>
+              </div>
+              <span class="visits-range" id="visits-range">—</span>
+            </div>
+            <div class="data-grid visits-summary">
+              <div class="data-metric-card">
+                <div class="dmc-title">Visits</div>
+                <div class="dmc-value" id="vis-total">—</div>
+                <div class="dmc-sub" id="vis-total-sub">—</div>
+              </div>
+              <div class="data-metric-card">
+                <div class="dmc-title">Countries</div>
+                <div class="dmc-value" id="vis-countries">—</div>
+                <div class="dmc-sub">With at least one visit</div>
+              </div>
+              <div class="data-metric-card">
+                <div class="dmc-title">Top country</div>
+                <div class="dmc-value vis-top" id="vis-top">—</div>
+                <div class="dmc-sub" id="vis-top-sub">—</div>
+              </div>
+            </div>
+            <div class="visits-note" id="visits-note" style="display:none"></div>
+            <div class="visits-chart-wrap" id="visits-chart-wrap">
+              <canvas id="visits-chart" aria-label="Visits over time"></canvas>
+            </div>
+            <table class="data-table visits-table">
+              <thead><tr><th>#</th><th>Country</th><th class="num">Visits</th><th>Share</th></tr></thead>
+              <tbody id="visits-body"><tr><td colspan="4" class="table-empty">Loading…</td></tr></tbody>
+            </table>
+            <p class="visits-foot" id="visits-foot"></p>
           </div>
         </div>
       </div>
@@ -368,6 +411,10 @@
             <span class="settings-value" id="s-monitor-status">—</span>
           </div>
           <div class="settings-row">
+            <label>Monitored regions</label>
+            <span class="settings-value" id="s-monitor-regions">—</span>
+          </div>
+          <div class="settings-row">
             <label>Last run</label>
             <span class="settings-value" id="s-last-run">—</span>
           </div>
@@ -378,7 +425,8 @@
         </div>
         <div class="settings-section">
           <div class="settings-section-title">About ANSASphere</div>
-          <div class="settings-row"><label>Version</label><span class="settings-value">1.0.0</span></div>
+          <div class="settings-row"><label>Version</label><span class="settings-value">1.1.0</span></div>
+          <div class="settings-row"><label>Coverage</label><span class="settings-value">Nigeria · 37 states · 774 LGAs</span></div>
           <div class="settings-row"><label>Data source</label><span class="settings-value">Google Earth Engine</span></div>
           <div class="settings-row"><label>Satellite</label><span class="settings-value">Sentinel-1 SAR</span></div>
           <div class="settings-row"><label>Platform</label><span class="settings-value">PythonAnywhere</span></div>
@@ -399,19 +447,11 @@
           Climate &amp; Environment Monitor
         </span>
         <div class="win-toolbar">
-          <select id="climate-region-select" class="win-select">
-            <option value="nigeria">Nigeria</option>
-            <option value="ghana">Ghana</option>
-            <option value="kenya">Kenya</option>
-            <option value="ethiopia">Ethiopia</option>
-            <option value="mozambique">Mozambique</option>
-            <option value="tanzania">Tanzania</option>
-            <option value="bangladesh">Bangladesh</option>
-            <option value="india">India</option>
-            <option value="pakistan">Pakistan</option>
-            <option value="myanmar">Myanmar</option>
-            <option value="thailand">Thailand</option>
-            <option value="indonesia">Indonesia</option>
+          <select id="climate-state-select" class="win-select" title="State">
+            <option value="nigeria">Loading states…</option>
+          </select>
+          <select id="climate-lga-select" class="win-select" title="Local Government Area" disabled>
+            <option value="">All LGAs</option>
           </select>
           <input type="date" id="climate-date-input" class="win-date-input" />
           <button class="win-action-btn" id="run-climate-btn">
@@ -553,7 +593,7 @@
       <div class="modal-body">
         <div class="form-group">
           <label>Region</label>
-          <input type="text" id="modal-region" class="form-input" placeholder="e.g. Nigeria — Benue State" />
+          <input type="text" id="modal-region" class="form-input" placeholder="e.g. Benue State or Makurdi LGA, Benue" />
         </div>
         <div class="form-group">
           <label>Risk Level</label>
@@ -583,9 +623,11 @@
 
 <!-- Scripts -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<script src="/static/js/desktop.js"></script>
-<script src="/static/js/map_viewer.js"></script>
-<script src="/static/js/ai_agent.js"></script>
-<script src="/static/js/climate.js"></script>
+<script src="/static/js/desktop.js?v=1.1.0"></script>
+<script src="/static/js/nigeria_admin.js?v=1.1.0"></script>
+<script src="/static/js/map_viewer.js?v=1.1.0"></script>
+<script src="/static/js/ai_agent.js?v=1.1.0"></script>
+<script src="/static/js/climate.js?v=1.1.0"></script>
+<script src="/static/js/visitors.js?v=1.2.0"></script>
 </body>
 </html>

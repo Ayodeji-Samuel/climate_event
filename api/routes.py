@@ -2,17 +2,19 @@
 api/routes.py
 All REST endpoints for ANSASphere.
 Module instances are retrieved from Flask's current_app.
+
+Regions are Nigeria, its 37 states and 774 LGAs (modules/nigeria_admin.py):
+  region_id = "nigeria" | "<state>" | "<state>/<lga>"   e.g. "lagos/surulere"
+Boundary GeoJSON is served as static files from /static/geo/nigeria/.
 """
 
-import json
 import logging
-import time
-import urllib.request
+import re
 from datetime import datetime
-from urllib.parse import urlparse
-from flask import (
-    Blueprint, current_app, jsonify, request, Response, stream_with_context
-)
+from flask import Blueprint, current_app, jsonify, request
+
+from modules.nigeria_admin import ADMIN
+from modules.visit_tracker import PERIODS
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +45,47 @@ def _alerts():
     return current_app.alert_system
 
 
+def _visits():
+    return current_app.visit_tracker
+
+
 def _ok(data: dict, status: int = 200):
     return jsonify({"status": "ok", **data}), status
 
 
 def _err(message: str, status: int = 400):
     return jsonify({"status": "error", "message": message}), status
+
+
+def _int_arg(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _region_arg():
+    """(region_id, error_response) for the ?region_id= query param."""
+    region_id = (request.args.get("region_id") or "nigeria").strip().lower()
+    if ADMIN.get(region_id) is None:
+        return region_id, _err(
+            f"Unknown region '{region_id}'. Use 'nigeria', a state id (e.g. 'lagos') "
+            "or 'state/lga' (e.g. 'lagos/surulere'); see GET /api/regions.")
+    return region_id, None
+
+
+def _bbox_arg():
+    """(bbox list | None, error_response)."""
+    raw_bbox = request.args.get("bbox")
+    if not raw_bbox:
+        return None, None
+    try:
+        bbox = [float(v) for v in raw_bbox.split(",")]
+    except ValueError:
+        return None, _err("Invalid bbox format")
+    if len(bbox) != 4:
+        return None, _err("bbox must be 4 comma-separated floats: west,south,east,north")
+    return bbox, None
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +99,7 @@ def health():
     alert_stats = _alerts().stats()
     return _ok({
         "service": "ANSASphere",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "timestamp": datetime.utcnow().isoformat(),
         "gee": gee_status,
         "agent": agent_status,
@@ -82,8 +119,27 @@ def gee_reconnect():
 
 
 # ---------------------------------------------------------------------------
-# Regions
+# Regions  (Nigeria → states → LGAs)
 # ---------------------------------------------------------------------------
+
+@api_bp.get("/regions")
+def regions():
+    """Country + the 37 states, each with its LGA count."""
+    return _ok({
+        "country": ADMIN.country.to_dict(),
+        "states": [{**s.to_dict(), "lga_count": len(ADMIN.lgas(s.id))}
+                   for s in ADMIN.states()],
+    })
+
+
+@api_bp.get("/regions/<state_id>/lgas")
+def region_lgas(state_id: str):
+    state = ADMIN.get(state_id)
+    if state is None or state.level != "state":
+        return _err(f"Unknown state '{state_id}'", 404)
+    return _ok({"state": state.to_dict(),
+                "lgas": [l.to_dict() for l in ADMIN.lgas(state.id)]})
+
 
 @api_bp.get("/flood/regions")
 def flood_regions():
@@ -98,22 +154,17 @@ def flood_regions():
 def flood_analyze():
     """
     Query params:
-      region_id  – one of the known region IDs  (default: nigeria)
-      date       – ISO date YYYY-MM-DD           (default: today)
-      bbox       – west,south,east,north         (optional, overrides region bbox)
+      region_id  – nigeria | <state> | <state>/<lga>   (default: nigeria)
+      date       – ISO date YYYY-MM-DD                  (default: today)
+      bbox       – west,south,east,north                (optional, overrides region)
     """
-    region_id = request.args.get("region_id", "nigeria")
-    date = request.args.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
-
-    bbox = None
-    raw_bbox = request.args.get("bbox")
-    if raw_bbox:
-        try:
-            bbox = [float(v) for v in raw_bbox.split(",")]
-            if len(bbox) != 4:
-                return _err("bbox must be 4 comma-separated floats: west,south,east,north")
-        except ValueError:
-            return _err("Invalid bbox format")
+    region_id, error = _region_arg()
+    if error:
+        return error
+    bbox, error = _bbox_arg()
+    if error:
+        return error
+    date = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
 
     use_cache = request.args.get("no_cache", "0") != "1"
     result = _detector().analyze(region_id=region_id, event_date=date, bbox=bbox, use_cache=use_cache)
@@ -123,7 +174,9 @@ def flood_analyze():
 @api_bp.get("/flood/water-layer")
 def flood_water_layer():
     """Return JRC permanent water tile URL for a region."""
-    region_id = request.args.get("region_id", "nigeria")
+    region_id, error = _region_arg()
+    if error:
+        return error
     result = _detector().get_permanent_water_tiles(region_id)
     return _ok(result)
 
@@ -138,7 +191,7 @@ def list_alerts():
     if active_only:
         alerts = _alerts().get_active()
     else:
-        limit = min(int(request.args.get("limit", 100)), 500)
+        limit = max(1, min(_int_arg(request.args.get("limit"), 100), 500))
         alerts = _alerts().get_all(limit=limit)
     return _ok({"alerts": alerts, "count": len(alerts)})
 
@@ -146,9 +199,9 @@ def list_alerts():
 @api_bp.post("/alerts")
 def create_alert():
     data = request.get_json(force=True, silent=True) or {}
-    region = data.get("region", "").strip()
-    level = int(data.get("level", 1))
-    message = data.get("message", "").strip()
+    region = str(data.get("region", "")).strip()
+    level = _int_arg(data.get("level", 1), -1)
+    message = str(data.get("message", "")).strip()
 
     if not region:
         return _err("'region' is required")
@@ -171,13 +224,65 @@ def resolve_alert(alert_id: int):
 
 @api_bp.delete("/alerts/<int:alert_id>")
 def delete_alert(alert_id: int):
-    _alerts().delete(alert_id)
+    if not _alerts().delete(alert_id):
+        return _err("Alert not found", 404)
     return _ok({"deleted": alert_id})
 
 
 @api_bp.get("/alerts/stats")
 def alert_stats():
     return _ok(_alerts().stats())
+
+
+# ---------------------------------------------------------------------------
+# Visitor statistics  (visits per country)
+# ---------------------------------------------------------------------------
+
+_VISIT_COOKIE = "ansa_visit"
+_BOT_UA = re.compile(
+    r"bot|crawl|spider|slurp|headless|lighthouse|preview|curl|wget|python-requests", re.I)
+
+
+def _client_ip() -> str:
+    # PythonAnywhere's load balancer puts the real client address in
+    # X-Real-IP (X-Forwarded-For can be forged by the client).  Locally
+    # there is no proxy, so fall back to the socket address.
+    return (request.headers.get("X-Real-IP") or request.remote_addr or "").strip()
+
+
+@api_bp.post("/visits")
+def record_visit():
+    """
+    Sent by the page once it has loaded (crawlers that don't run JavaScript
+    never call it).  A browser is counted once per VISIT_SESSION_MINUTES of
+    activity — the cookie only marks "already counted" and holds no
+    identifier.  Only the visitor's country is stored, never the IP.
+    """
+    country = None
+    if (request.cookies.get(_VISIT_COOKIE) is None
+            and not _BOT_UA.search(request.user_agent.string or "")):
+        country = _visits().record(_client_ip())
+    resp, status = _ok({"counted": country is not None, "country": country})
+    # Refreshed on every page load, so the session lasts while the visitor is active
+    resp.set_cookie(_VISIT_COOKIE, "1",
+                    max_age=current_app.config["VISIT_SESSION_MINUTES"] * 60,
+                    httponly=True, samesite="Lax")
+    return resp, status
+
+
+@api_bp.get("/visits/stats")
+def visit_stats():
+    """
+    Query params:
+      period – day | week | month | all   (default: week)
+               today, last 7 days, last 30 days, all time — in local time
+    """
+    period = (request.args.get("period") or "week").strip().lower()
+    if period not in PERIODS:
+        return _err(f"'period' must be one of: {', '.join(PERIODS)}")
+    return _ok({**_visits().stats(period),
+                "geoip": _visits().geoip_status,
+                "session_minutes": current_app.config["VISIT_SESSION_MINUTES"]})
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +293,7 @@ def alert_stats():
 def ai_chat():
     data = request.get_json(force=True, silent=True) or {}
     message = (data.get("message") or "").strip()
-    session_id = data.get("session_id", "default")
+    session_id = str(data.get("session_id") or "default")[:100]
 
     if not message:
         return _err("'message' is required")
@@ -206,8 +311,12 @@ def ai_status():
 def start_monitor():
     data = request.get_json(force=True, silent=True) or {}
     regions = data.get("regions")
-    interval = int(data.get("interval", 3600))
-    _agent().start_monitor(regions=regions, interval=interval)
+    interval = max(60, _int_arg(data.get("interval"), current_app.config["MONITOR_INTERVAL"]))
+    if not _agent().start_monitor(regions=regions, interval=interval):
+        return _err(
+            "Background threads are disabled on this server (PythonAnywhere doesn't "
+            "support them in web apps). The monitor runs as a scheduled task: "
+            "run_monitor.py.", 409)
     return _ok({"message": "Monitor started", "status": _agent().monitor_status})
 
 
@@ -218,173 +327,8 @@ def stop_monitor():
 
 
 # ---------------------------------------------------------------------------
-# Server-Sent Events — real-time push to frontend
-# ---------------------------------------------------------------------------
-
-@api_bp.get("/events/stream")
-def event_stream():
-    """
-    SSE endpoint.  Pushes system status every 30 s and alert changes.
-    Clients connect once; no polling needed.
-    """
-    def generate():
-        last_alert_count = -1
-        tick = 0
-        while True:
-            try:
-                # Every 30 s: system heartbeat
-                gee_ok = _gee().is_connected
-                active_alerts = _alerts().get_active()
-                alert_count = len(active_alerts)
-                high_alerts = [a for a in active_alerts if a.get("level", 0) >= 3]
-
-                payload = {
-                    "type": "heartbeat",
-                    "tick": tick,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "gee_connected": gee_ok,
-                    "active_alerts": alert_count,
-                    "high_alerts": len(high_alerts),
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-
-                # Push alert diff if count changed
-                if alert_count != last_alert_count:
-                    alert_payload = {
-                        "type": "alerts_update",
-                        "alerts": active_alerts[:10],  # top 10
-                        "count": alert_count,
-                    }
-                    yield f"data: {json.dumps(alert_payload)}\n\n"
-                    last_alert_count = alert_count
-
-                tick += 1
-                time.sleep(30)
-
-            except GeneratorExit:
-                break
-            except Exception as exc:
-                logger.warning("SSE error: %s", exc)
-                break
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # important for Nginx/PythonAnywhere
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
 # Climate Layers  (15 environmental layers)
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Geo Boundary  (GEE-backed – no external HTTP, no GitHub CDN slowness)
-# ---------------------------------------------------------------------------
-# ADM0: FAO/GAUL_SIMPLIFIED_500m/2015/level0  (country polygon, UN names)
-# ADM1: FAO/GAUL_SIMPLIFIED_500m/2015/level1  (province/state polygons)
-
-# ADM0_NAME values in FAO/GAUL_SIMPLIFIED_500m/2015 (UN/FAO standard names)
-_ISO3_TO_GAUL: dict = {
-    "NGA": "Nigeria",
-    "GHA": "Ghana",
-    "KEN": "Kenya",
-    "ETH": "Ethiopia",
-    "MOZ": "Mozambique",
-    "TZA": "United Republic of Tanzania",
-    "BGD": "Bangladesh",
-    "IND": "India",
-    "PAK": "Pakistan",
-    "MMR": "Myanmar",
-    "THA": "Thailand",
-    "IDN": "Indonesia",
-}
-
-_geo_cache: dict = {}   # { "NGA_ADM0": <geojson dict> }
-
-_POLYGON_TYPES = {"Polygon", "MultiPolygon", "GeometryCollection"}
-
-
-def _strip_non_polygon(geom: dict) -> dict:
-    """
-    Recursively remove Point/LineString sub-geometries from a GeometryCollection.
-    Prevents Leaflet from auto-rendering spurious markers for non-polygon parts.
-    """
-    if geom and geom.get("type") == "GeometryCollection":
-        geom["geometries"] = [
-            _strip_non_polygon(g)
-            for g in geom.get("geometries", [])
-            if g.get("type") in _POLYGON_TYPES
-        ]
-    return geom
-
-
-@api_bp.get("/geo/boundary")
-def geo_boundary():
-    """
-    Return a GeoJSON FeatureCollection for a country boundary via GEE.
-    Query params:
-      iso3  – 3-letter ISO country code  (e.g. NGA)
-      level – ADM0 or ADM1               (default: ADM0)
-    Both levels use FAO/GAUL_SIMPLIFIED_500m/2015 (500m-simplified, fast).
-    ADM0 merges all features into a single geometry for the inverse mask.
-    """
-    iso3  = (request.args.get("iso3")  or "").strip().upper()
-    level = (request.args.get("level") or "ADM0").strip().upper()
-
-    if not iso3:
-        return _err("'iso3' is required")
-    if level not in ("ADM0", "ADM1"):
-        return _err("'level' must be ADM0 or ADM1")
-
-    gaul_name = _ISO3_TO_GAUL.get(iso3)
-    if not gaul_name:
-        return _err(f"Unsupported country: {iso3}", 400)
-
-    cache_key = f"{iso3}_{level}"
-    if cache_key in _geo_cache:
-        return jsonify(_geo_cache[cache_key])
-
-    try:
-        gee_engine = current_app.gee
-        if not gee_engine.is_connected:
-            return _err("GEE not connected", 503)
-        ee = gee_engine._ee
-
-        gaul_level = "level0" if level == "ADM0" else "level1"
-        dataset = f"FAO/GAUL_SIMPLIFIED_500m/2015/{gaul_level}"
-
-        if level == "ADM0":
-            # Merge all country features (mainland + islands) into one geometry
-            geom = (ee.FeatureCollection(dataset)
-                      .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
-                      .geometry())
-            fc = ee.FeatureCollection([ee.Feature(geom, {"iso3": iso3, "name": gaul_name})])
-        else:
-            fc = (ee.FeatureCollection(dataset)
-                    .filter(ee.Filter.eq("ADM0_NAME", gaul_name))
-                    .select(["ADM0_NAME", "ADM1_NAME"]))
-
-        geojson = fc.getInfo()
-        if not geojson.get("features"):
-            return _err(f"No boundary data found for {iso3}/{level}", 404)
-
-        # Strip Point/LineString sub-geometries so Leaflet doesn't render markers
-        for feat in geojson.get("features", []):
-            if feat.get("geometry"):
-                _strip_non_polygon(feat["geometry"])
-
-        _geo_cache[cache_key] = geojson
-        return jsonify(geojson)
-
-    except Exception as exc:
-        logger.warning("geo_boundary error for %s/%s: %s", iso3, level, exc)
-        return _err(f"Failed to fetch boundary: {exc}", 502)
-
 
 @api_bp.get("/climate/layers")
 def climate_layers():
@@ -396,29 +340,24 @@ def climate_layers():
 def climate_analyze():
     """
     Query params:
-      layer_id   – one of the 15 layer IDs  (required)
-      region_id  – known region ID          (default: nigeria)
-      date       – ISO date YYYY-MM-DD      (default: today)
-      bbox       – west,south,east,north    (optional, overrides region bbox)
-      no_cache   – '1' to bypass cache      (default: use cache)
+      layer_id   – one of the 15 layer IDs                (required)
+      region_id  – nigeria | <state> | <state>/<lga>      (default: nigeria)
+      date       – ISO date YYYY-MM-DD                    (default: today)
+      bbox       – west,south,east,north                  (optional, overrides region)
+      no_cache   – '1' to bypass cache                    (default: use cache)
     """
     layer_id  = request.args.get("layer_id", "").strip()
-    region_id = request.args.get("region_id", "nigeria").strip()
-    date      = request.args.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
+    date      = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
     no_cache  = request.args.get("no_cache", "0") == "1"
 
     if not layer_id:
         return _err("'layer_id' is required. Use GET /api/climate/layers to list options.")
-
-    bbox = None
-    raw_bbox = request.args.get("bbox")
-    if raw_bbox:
-        try:
-            bbox = [float(v) for v in raw_bbox.split(",")]
-            if len(bbox) != 4:
-                return _err("bbox must be 4 floats: west,south,east,north")
-        except ValueError:
-            return _err("Invalid bbox format")
+    region_id, error = _region_arg()
+    if error:
+        return error
+    bbox, error = _bbox_arg()
+    if error:
+        return error
 
     if not _gee().is_connected:
         return _ok({
@@ -449,13 +388,15 @@ def climate_multi():
     Run several layers at once for a single region.
     Query params:
       layers    – comma-separated layer IDs (e.g. vegetation,fires,temperature)
-      region_id – known region ID
+      region_id – nigeria | <state> | <state>/<lga>
       date      – ISO date YYYY-MM-DD
     Returns a dict keyed by layer_id.
     """
     raw_layers = request.args.get("layers", "")
-    region_id  = request.args.get("region_id", "nigeria").strip()
-    date       = request.args.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
+    date       = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+    region_id, error = _region_arg()
+    if error:
+        return error
 
     layer_ids = [l.strip() for l in raw_layers.split(",") if l.strip()]
     if not layer_ids:
@@ -487,48 +428,16 @@ def climate_cache_stats():
     })
 
 
-# Hosts whose GeoJSON download URLs are trusted for the boundary proxy.
-_ALLOWED_BOUNDARY_HOSTS = frozenset({
-    "www.geoboundaries.org",
-    "github.com",
-    "raw.githubusercontent.com",
-    "cdn.geoboundaries.org",
-})
-
-
-@api_bp.get("/proxy/boundary")
-def proxy_boundary():
-    """
-    Proxies GeoJSON boundary file downloads server-side to avoid the browser
-    hitting GitHub's CORS restrictions (and Git-LFS pointer redirects).
-    Only URLs whose hostname is in _ALLOWED_BOUNDARY_HOSTS are forwarded.
-    """
-    url = request.args.get("url", "").strip()
-    if not url:
-        return _err("'url' param required"), 400
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or parsed.hostname not in _ALLOWED_BOUNDARY_HOSTS:
-        return _err("Untrusted or invalid URL"), 403
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ANSASphere/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-        return jsonify(data)
-    except Exception as exc:
-        logger.warning("proxy_boundary failed for %s: %s", url, exc)
-        return _err("Failed to fetch boundary"), 502
-
-
 @api_bp.get("/climate/trend")
 def climate_trend():
     """
     Compute a 12-month time series + 2 correlated layer series for a layer.
 
     Query params:
-      layer_id   – one of the 15 layer IDs  (required)
-      region_id  – known region ID          (default: nigeria)
-      date       – ISO date YYYY-MM-DD      (default: today)
-      months     – number of months         (default: 12, range: 3–24)
+      layer_id   – one of the 15 layer IDs              (required)
+      region_id  – nigeria | <state> | <state>/<lga>    (default: nigeria)
+      date       – ISO date YYYY-MM-DD                  (default: today)
+      months     – number of months                     (default: 12, range: 3–24)
 
     Returns:
       { result: { success, primary: {label, unit, series},
@@ -536,17 +445,14 @@ def climate_trend():
                   insight: str } }
     """
     layer_id  = request.args.get("layer_id", "").strip()
-    region_id = request.args.get("region_id", "nigeria").strip()
-    date      = request.args.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
-    months    = request.args.get("months", "12")
+    date      = request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+    months    = max(3, min(24, _int_arg(request.args.get("months"), 12)))
 
     if not layer_id:
         return _err("'layer_id' is required.")
-
-    try:
-        months = max(3, min(24, int(months)))
-    except (TypeError, ValueError):
-        months = 12
+    region_id, error = _region_arg()
+    if error:
+        return error
 
     if not _gee().is_connected:
         return _ok({"result": {"success": False, "message": "GEE not connected"}})
@@ -558,4 +464,3 @@ def climate_trend():
         months=months,
     )
     return _ok({"result": result})
-

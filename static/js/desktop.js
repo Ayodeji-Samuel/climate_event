@@ -504,12 +504,7 @@ function updateGEEStatusUI(connected) {
 ══════════════════════════════════════════════════════════════ */
 async function loadInitialData() {
   try {
-    const [healthRes, regionsRes] = await Promise.all([
-      fetch('/api/health'),
-      fetch('/api/flood/regions'),
-    ]);
-    const health  = await healthRes.json();
-    const regions = await regionsRes.json();
+    const health = await apiJSON('/api/health', { timeout: 30000 });
 
     // GEE status
     updateGEEStatusUI(health.gee?.connected);
@@ -519,20 +514,12 @@ async function loadInitialData() {
     const badge = document.getElementById('ai-engine-badge');
     if (badge) badge.textContent = aiEngine;
 
-    // Populate region dropdown
-    const sel = document.getElementById('flood-region-select');
-    if (sel && regions.regions) {
-      sel.innerHTML = regions.regions
-        .map(r => `<option value="${r.id}">${r.label}</option>`)
-        .join('');
-    }
-
     // Settings panel
     updateSettings(health);
     // Data explorer overview
     updateDataOverview(health);
-    // Regions in data explorer
-    populateRegionsGrid(regions.regions || []);
+    // States in data explorer
+    populateRegionsGrid();
     // Load alert history
     loadAlertHistory();
     // Load active alerts for alert center
@@ -553,22 +540,44 @@ async function loadInitialData() {
 /* ══════════════════════════════════════════════════════════════
    SETTINGS PANEL
 ══════════════════════════════════════════════════════════════ */
+function monitorLabel(agent) {
+  if (!agent) return '—';
+  if (agent.mode === 'scheduled-task') return 'Scheduled task';
+  return agent.running ? 'Running' : 'Stopped';
+}
+
+let _settingsBound = false;
 function updateSettings(health) {
   setText('s-gee-project', health.gee?.project || '—');
   setText('s-gee-status', health.gee?.connected ? '✓ Connected' : '✗ Disconnected');
   setText('s-ai-engine', health.agent?.engine || '—');
-  setText('s-monitor-status', health.agent?.running ? 'Running' : 'Stopped');
+  setText('s-monitor-status', monitorLabel(health.agent));
+  setText('s-monitor-regions', (health.agent?.regions || []).join(', ') || '—');
   const lr = health.agent?.last_run;
-  setText('s-last-run', lr ? new Date(lr).toLocaleTimeString() : 'Never');
+  setText('s-last-run', lr ? new Date(lr + (lr.endsWith('Z') ? '' : 'Z')).toLocaleString() : 'Never');
 
+  // On PythonAnywhere the monitor is a scheduled task — no start/stop here
+  const scheduled = health.agent?.mode === 'scheduled-task';
+  ['s-start-monitor', 's-stop-monitor'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.style.display = scheduled ? 'none' : '';
+  });
+
+  // loadInitialData() runs again after a reconnect — bind handlers only once
+  if (_settingsBound) return;
+  _settingsBound = true;
   document.getElementById('s-gee-reconnect')?.addEventListener('click', async () => {
     await fetch('/api/gee/reconnect', { method: 'POST' });
     showToast('GEE', 'Reconnect requested', 'info');
     setTimeout(loadInitialData, 2000);
   });
   document.getElementById('s-start-monitor')?.addEventListener('click', async () => {
-    await fetch('/api/ai/monitor/start', { method: 'POST' });
-    showToast('AI Monitor', 'Background monitor started', 'success');
+    try {
+      await apiJSON('/api/ai/monitor/start', { method: 'POST', timeout: 15000 });
+      showToast('AI Monitor', 'Background monitor started', 'success');
+    } catch (err) {
+      showToast('AI Monitor', err.message, 'warning');
+    }
   });
   document.getElementById('s-stop-monitor')?.addEventListener('click', async () => {
     await fetch('/api/ai/monitor/stop', { method: 'POST' });
@@ -583,22 +592,27 @@ function updateDataOverview(health) {
   setText('de-gee-status', health.gee?.connected ? 'Online' : 'Offline');
   setText('de-alerts',     health.alerts?.active ?? '—');
   setText('de-ai-engine',  health.agent?.engine  || '—');
-  setText('de-monitor',    health.agent?.running  ? 'Active' : 'Stopped');
+  setText('de-monitor',    monitorLabel(health.agent));
 }
 
-function populateRegionsGrid(regions) {
+async function populateRegionsGrid() {
   const grid = document.getElementById('regions-grid');
   if (!grid) return;
-  grid.innerHTML = regions.map(r =>
-    `<div class="region-chip" data-region="${r.id}">${r.label}</div>`
-  ).join('');
-  grid.querySelectorAll('.region-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      const sel = document.getElementById('flood-region-select');
-      if (sel) sel.value = chip.dataset.region;
-      openApp('flood-monitor');
+  try {
+    const idx = await NigeriaAdmin.index();
+    grid.innerHTML = idx.states.map(s =>
+      `<div class="region-chip" data-region="${s.id}" title="${s.lgas.length} LGAs">` +
+      `${esc(s.name)} <small>${s.lgas.length}</small></div>`
+    ).join('');
+    grid.querySelectorAll('.region-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        openApp('flood-monitor');
+        window.ANSA?.selectFloodRegion?.(chip.dataset.region);
+      });
     });
-  });
+  } catch (err) {
+    grid.textContent = 'Could not load the state list.';
+  }
 }
 
 function loadAlertHistory() {
@@ -636,11 +650,7 @@ document.addEventListener('click', e => {
   document.getElementById(`tab-${tabId}`)?.classList.add('active');
 
   if (tabId === 'history') loadAlertHistory();
-  if (tabId === 'regions') {
-    fetch('/api/flood/regions')
-      .then(r => r.json())
-      .then(d => populateRegionsGrid(d.regions || []));
-  }
+  if (tabId === 'regions') populateRegionsGrid();
 });
 
 /* ══════════════════════════════════════════════════════════════
@@ -740,8 +750,7 @@ document.getElementById('alert-modal-submit')?.addEventListener('click', async (
 
 // Quick create alert from flood monitor
 document.getElementById('flood-alert-btn')?.addEventListener('click', () => {
-  const region = document.getElementById('flood-region-select')?.value || '';
-  const meta   = APP_META['flood-monitor'];
+  const region = window.ANSA?.floodRegion?.()?.label || 'Nigeria';
   document.getElementById('modal-region').value  = region;
   document.getElementById('modal-message').value = `Flood detected in ${region} — automated from satellite analysis.`;
   document.getElementById('alert-modal').style.display = 'flex';
@@ -756,6 +765,34 @@ function esc(str) {
     .replace(/</g,'&lt;')
     .replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;');
+}
+
+/**
+ * fetch + JSON with a timeout and readable errors.  A PythonAnywhere worker
+ * that runs past its 300 s limit is answered with an HTML 502/504 page,
+ * which res.json() would report as a cryptic "Unexpected token '<'".
+ */
+async function apiJSON(url, { timeout = 180000, ...options } = {}) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    let data = null;
+    try { data = await res.json(); } catch { /* HTML error page */ }
+    if (!res.ok || !data) {
+      throw new Error(data?.message || ([502, 503, 504].includes(res.status)
+        ? 'The server took too long to respond. Try a single state or LGA, or try again in a minute.'
+        : `Server error (HTTP ${res.status})`));
+    }
+    return data;
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`No response after ${Math.round(timeout / 1000)} s. Try a single state or LGA, or try again.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function setText(id, val) {
@@ -783,4 +820,4 @@ function hexAlpha(hex, alpha) {
 document.addEventListener('DOMContentLoaded', runBoot);
 
 // Expose helpers to other scripts
-window.ANSA = { openApp, showToast, addNotification, loadAlerts, esc };
+window.ANSA = { openApp, showToast, addNotification, loadAlerts, esc, apiJSON };

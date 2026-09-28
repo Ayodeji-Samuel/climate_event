@@ -10,6 +10,8 @@ UNOSAT/ESA methodology:
   6. Compute flooded area & risk level
   7. Return tile URL + metadata dict
 
+Regions are Nigeria, any of its 37 states, or any of its 774 LGAs
+(see modules/nigeria_admin.py); analysis is clipped to the exact boundary.
 Results are cached in GEEEngine.cache to avoid redundant EE calls.
 """
 
@@ -18,79 +20,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 
 from modules.gee_engine import GEEEngine
+from modules.nigeria_admin import ADMIN, Region
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Known regions: (country, [west, south, east, north])
-# ---------------------------------------------------------------------------
-KNOWN_REGIONS: Dict[str, Dict] = {
-    "nigeria": {
-        "label": "Nigeria",
-        "country": "Nigeria",
-        "bbox": [2.676932, 4.240594, 14.680073, 13.885645],
-    },
-    "ghana": {
-        "label": "Ghana",
-        "country": "Ghana",
-        "bbox": [-3.260786, 4.737842, 1.187968, 11.173482],
-    },
-    "kenya": {
-        "label": "Kenya",
-        "country": "Kenya",
-        "bbox": [33.908859, -4.720446, 41.899578, 4.622203],
-    },
-    "ethiopia": {
-        "label": "Ethiopia",
-        "country": "Ethiopia",
-        "bbox": [32.997734, 3.403202, 47.978478, 14.894254],
-    },
-    "mozambique": {
-        "label": "Mozambique",
-        "country": "Mozambique",
-        "bbox": [30.216253, -26.861025, 40.835802, -10.471883],
-    },
-    "bangladesh": {
-        "label": "Bangladesh",
-        "country": "Bangladesh",
-        "bbox": [88.008940, 20.670883, 92.673546, 26.631412],
-    },
-    "india": {
-        "label": "India",
-        "country": "India",
-        "bbox": [68.162386, 6.747139, 97.395555, 35.504475],
-    },
-    "pakistan": {
-        "label": "Pakistan",
-        "country": "Pakistan",
-        "bbox": [60.872971, 23.694695, 77.840194, 37.097012],
-    },
-    "myanmar": {
-        "label": "Myanmar",
-        "country": "Myanmar",
-        "bbox": [92.189225, 9.784569, 101.170506, 28.534878],
-    },
-    "thailand": {
-        "label": "Thailand",
-        "country": "Thailand",
-        "bbox": [97.343398, 5.612851, 105.636812, 20.465045],
-    },
-    "indonesia": {
-        "label": "Indonesia",
-        "country": "Indonesia",
-        "bbox": [95.010776, -10.359987, 141.019965, 5.479821],
-    },
-    "tanzania": {
-        "label": "Tanzania",
-        "country": "Tanzania",
-        "bbox": [29.340000, -11.745696, 40.443222, -0.990736],
-    },
-    "custom": {
-        "label": "Custom BBox",
-        "country": None,
-        "bbox": None,       # populated at query time
-    },
-}
 
 # Risk band labels keyed by (level 0–4)
 RISK_LABELS = {0: "None", 1: "Watch", 2: "Advisory", 3: "Warning", 4: "Emergency"}
@@ -108,11 +40,10 @@ FLOOD_VIS = {
     "max": 1,
     "palette": ["#00a8ff"],   # Electric blue for flooded pixels
 }
-WATER_VIS = {
-    "min": 0,
-    "max": 1,
-    "palette": ["#0050a0"],   # Dark blue for permanent water
-}
+
+# reduceRegion scale (m) for the flooded-area sum.  Sentinel-1 is 10 m;
+# larger units use coarser scales to stay well inside the EE time limit.
+AREA_SCALE = {"lga": 20, "state": 50, "country": 100, "custom": 50}
 
 
 class FloodDetector:
@@ -124,17 +55,20 @@ class FloodDetector:
         self._adv = float(self.cfg.get("FLOOD_ADV_THRESHOLD", 0.15))
         self._high = float(self.cfg.get("FLOOD_HIGH_THRESHOLD", 0.30))
         self._emerg = float(self.cfg.get("FLOOD_EMERG_THRESHOLD", 0.50))
+        self._min_area_km2 = float(self.cfg.get("FLOOD_MIN_AREA_KM2", 0))
+
+    @property
+    def thresholds(self) -> Dict[int, float]:
+        """Minimum flooded fraction for each risk level (1–4)."""
+        return {1: self._warn, 2: self._adv, 3: self._high, 4: self._emerg}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def list_regions(self):
-        return [
-            {"id": k, "label": v["label"]}
-            for k, v in KNOWN_REGIONS.items()
-            if k != "custom"
-        ]
+        return [{"id": r.id, "label": r.label, "level": r.level}
+                for r in [ADMIN.country] + ADMIN.states()]
 
     def analyze(
         self,
@@ -150,10 +84,19 @@ class FloodDetector:
         if not self.gee.is_connected:
             return self._error_result("GEE not connected", region_id)
 
+        region = ADMIN.get(region_id)
+        if region is None and not bbox:
+            return self._error_result(f"Unknown region: {region_id}", region_id)
+
         if event_date is None:
             event_date = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            datetime.strptime(event_date, "%Y-%m-%d")
+        except ValueError:
+            return self._error_result(f"Invalid date '{event_date}' (expected YYYY-MM-DD)", region_id)
 
-        cache_key = f"flood:{region_id}:{event_date}"
+        bbox_key = ",".join(f"{v:.4f}" for v in bbox) if bbox else ""
+        cache_key = f"flood:{region_id}:{bbox_key}:{event_date}"
         if use_cache:
             cached = self.gee.cache.get_obj(cache_key)
             if cached:
@@ -161,8 +104,9 @@ class FloodDetector:
                 return cached
 
         try:
-            result = self._run_detection(region_id, event_date, bbox)
-            self.gee.cache.set(cache_key, result, ttl=1800)
+            result = self._run_detection(region, region_id, event_date, bbox)
+            if result.get("success"):
+                self.gee.cache.set(cache_key, result, ttl=1800)
             return result
         except Exception as exc:
             logger.exception("Flood detection failed for %s: %s", region_id, exc)
@@ -172,18 +116,16 @@ class FloodDetector:
         """Return tile URL for the JRC permanent water layer."""
         if not self.gee.is_connected:
             return {"error": "GEE not connected"}
+        region = ADMIN.get(region_id) or ADMIN.country
         try:
             ee = self.gee._ee
-            region_info = KNOWN_REGIONS.get(region_id, KNOWN_REGIONS["nigeria"])
-            bbox = region_info["bbox"]
-            aoi = self.gee.bbox_geometry(*bbox)
-
+            aoi = ADMIN.geometry(ee, region)
             jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
             jrc_clipped = jrc.updateMask(jrc.gt(50)).clip(aoi)
             tile_url = self.gee.image_to_tile_url(jrc_clipped, {
                 "min": 50, "max": 100, "palette": ["#c9eeff", "#0050a0"]
             })
-            return {"tile_url": tile_url, "layer": "permanent_water"}
+            return {"tile_url": tile_url, "layer": "permanent_water", "region_id": region.id}
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -192,77 +134,48 @@ class FloodDetector:
     # ------------------------------------------------------------------
 
     def _run_detection(
-        self, region_id: str, event_date: str, custom_bbox: Optional[list]
+        self, region: Optional[Region], region_id: str, event_date: str,
+        custom_bbox: Optional[list]
     ) -> Dict[str, Any]:
         ee = self.gee._ee
 
         # --- Region geometry -------------------------------------------
-        region_info = KNOWN_REGIONS.get(region_id)
-        if not region_info:
-            raise ValueError(f"Unknown region: {region_id}")
-
-        bbox = custom_bbox or region_info.get("bbox")
-        if not bbox:
-            raise ValueError("No bounding box for this region")
-        aoi = self.gee.bbox_geometry(*bbox)
+        if custom_bbox:
+            aoi = self.gee.bbox_geometry(*custom_bbox)
+            level, label, bbox = "custom", "Custom area", list(custom_bbox)
+        else:
+            aoi = ADMIN.geometry(ee, region)
+            level, label, bbox = region.level, region.label, list(region.bbox)
 
         # --- Date windows -----------------------------------------------
+        # Candidate (before, after, orbit) windows, tried in order.  All
+        # collection sizes are fetched in ONE round trip instead of up to six.
         event_dt = datetime.strptime(event_date, "%Y-%m-%d")
-        after_start = (event_dt - timedelta(days=7)).strftime("%Y-%m-%d")
-        after_end = (event_dt + timedelta(days=7)).strftime("%Y-%m-%d")
-        # Same season, previous year
-        before_start = (event_dt - timedelta(days=365 + 30)).strftime("%Y-%m-%d")
-        before_end = (event_dt - timedelta(days=365 - 30)).strftime("%Y-%m-%d")
 
-        # --- Sentinel-1 collections ------------------------------------
-        before_col = self.gee.get_s1_collection(aoi, before_start, before_end)
-        after_col = self.gee.get_s1_collection(aoi, after_start, after_end)
+        def d(days):
+            return (event_dt + timedelta(days=days)).strftime("%Y-%m-%d")
 
-        before_size = before_col.size().getInfo()
-        after_size = after_col.size().getInfo()
+        # Same season, previous year → post-event window around the date
+        strategies = [
+            ("DESCENDING", (d(-395), d(-335)), (d(-7), d(7))),
+            ("ASCENDING",  (d(-395), d(-335)), (d(-7), d(7))),
+            ("BOTH",       (d(-425), d(-305)), (d(-15), d(15))),   # widened
+        ]
+        cols = []
+        for orbit, before_win, after_win in strategies:
+            cols.append((
+                self.gee.get_s1_collection(aoi, *before_win, pass_direction=orbit),
+                self.gee.get_s1_collection(aoi, *after_win, pass_direction=orbit),
+            ))
+        sizes = ee.List([ee.List([b.size(), a.size()]) for b, a in cols]).getInfo()
 
-        logger.info(
-            "S1 DESCENDING images: before=%d (%s→%s), after=%d (%s→%s)",
-            before_size, before_start, before_end,
-            after_size, after_start, after_end,
-        )
-
-        # If DESCENDING pass has no data, try ASCENDING pass
-        if before_size == 0 or after_size == 0:
-            logger.info("No DESCENDING data — trying ASCENDING pass")
-            asc_before = self.gee.get_s1_collection(
-                aoi, before_start, before_end, pass_direction="ASCENDING"
-            )
-            asc_after = self.gee.get_s1_collection(
-                aoi, after_start, after_end, pass_direction="ASCENDING"
-            )
-            asc_before_sz = asc_before.size().getInfo()
-            asc_after_sz = asc_after.size().getInfo()
-            if asc_before_sz > 0 and asc_after_sz > 0:
-                before_col, after_col = asc_before, asc_after
-                before_size, after_size = asc_before_sz, asc_after_sz
-                logger.info("Using ASCENDING pass: before=%d, after=%d", before_size, after_size)
-
-        if before_size == 0 or after_size == 0:
-            # Widen search window and try both orbit passes
-            before_start = (event_dt - timedelta(days=365 + 60)).strftime("%Y-%m-%d")
-            before_end = (event_dt - timedelta(days=365 - 60)).strftime("%Y-%m-%d")
-            after_start = (event_dt - timedelta(days=15)).strftime("%Y-%m-%d")
-            after_end = (event_dt + timedelta(days=15)).strftime("%Y-%m-%d")
-            before_col = self.gee.get_s1_collection(
-                aoi, before_start, before_end, pass_direction="BOTH"
-            )
-            after_col = self.gee.get_s1_collection(
-                aoi, after_start, after_end, pass_direction="BOTH"
-            )
-            before_size = before_col.size().getInfo()
-            after_size = after_col.size().getInfo()
-            logger.info(
-                "Widened window (both passes): before=%d, after=%d", before_size, after_size
-            )
-
-        if before_size == 0 or after_size == 0:
-            return self._no_data_result(region_id, event_date, bbox)
+        chosen = next((i for i, (nb, na) in enumerate(sizes) if nb > 0 and na > 0), None)
+        logger.info("S1 image counts %s for %s on %s → strategy %s",
+                    sizes, region_id, event_date, chosen)
+        if chosen is None:
+            return self._no_data_result(region_id, label, event_date, bbox)
+        before_col, after_col = cols[chosen]
+        before_size, after_size = sizes[chosen]
 
         # --- Composites + speckle filter --------------------------------
         # 100 m focal-mean (≈10 Sentinel-1 pixels) gives a better SNR
@@ -288,12 +201,22 @@ class FloodDetector:
             .rename("flood")
         )
 
-        # --- Statistics --------------------------------------------------
-        flooded_area_km2 = self.gee.compute_area_km2(flooded, aoi, scale=100)
-        total_area_km2 = self.gee.compute_region_area_km2(aoi)
+        # --- Statistics (flooded + total area in one round trip) ---------
+        stats = ee.Dictionary({
+            "flooded_m2": flooded.multiply(ee.Image.pixelArea()).reduceRegion(
+                reducer=ee.Reducer.sum(), geometry=aoi, scale=AREA_SCALE[level],
+                maxPixels=1e11, bestEffort=True, tileScale=4,
+            ).get("flood"),
+            "total_m2": aoi.area(maxError=100),
+        }).getInfo()
+        flooded_area_km2 = round((stats.get("flooded_m2") or 0) / 1e6, 2)
+        total_area_km2 = round((stats.get("total_m2") or 0) / 1e6, 2)
         flood_fraction = (flooded_area_km2 / total_area_km2) if total_area_km2 else 0
 
-        risk_level, risk_label, risk_color = self._score_risk(flood_fraction)
+        # Below the minimum absolute area the "flood" is indistinguishable
+        # from speckle noise, however large a share of a tiny LGA it is.
+        risk_level, risk_label, risk_color = self._score_risk(
+            flood_fraction if flooded_area_km2 >= self._min_area_km2 else 0)
 
         # --- Visualisation tile URL -------------------------------------
         flooded_vis = flooded.selfMask()
@@ -308,7 +231,8 @@ class FloodDetector:
         return {
             "success": True,
             "region_id": region_id,
-            "region_label": region_info["label"],
+            "region_label": label,
+            "region_level": level,
             "event_date": event_date,
             "bbox": bbox,
             "flood_tile_url": tile_url,
@@ -349,10 +273,11 @@ class FloodDetector:
     # Fallback results
     # ------------------------------------------------------------------
 
-    def _no_data_result(self, region_id, event_date, bbox):
+    def _no_data_result(self, region_id, region_label, event_date, bbox):
         return {
             "success": False,
             "region_id": region_id,
+            "region_label": region_label,
             "event_date": event_date,
             "bbox": bbox,
             "message": "No Sentinel-1 imagery available for this date/region.",
@@ -368,9 +293,11 @@ class FloodDetector:
         }
 
     def _error_result(self, message, region_id):
+        region = ADMIN.get(region_id)
         return {
             "success": False,
             "region_id": region_id,
+            "region_label": region.label if region else region_id,
             "message": message,
             "flood_tile_url": None,
             "sar_tile_url": None,

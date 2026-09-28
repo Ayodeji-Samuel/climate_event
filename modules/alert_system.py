@@ -6,6 +6,7 @@ SQLite-backed alert CRUD.  Thread-safe; no external dependencies.
 import sqlite3
 import threading
 import logging
+from contextlib import contextmanager
 from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
@@ -53,11 +54,23 @@ class AlertSystem:
                 )
                 """
             )
+            # Small key/value store, e.g. the scheduled monitor's last run
+            # (it runs in a separate process on PythonAnywhere).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
 
-    def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+    @contextmanager
+    def _get_conn(self):
+        """Connection that commits on success and is always closed.
+        (`with sqlite3.connect(...)` alone commits but never closes.)"""
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # CRUD
@@ -119,11 +132,11 @@ class AlertSystem:
     def resolve(self, alert_id: int) -> bool:
         with self._lock:
             with self._get_conn() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE alerts SET active=0, resolved=? WHERE id=?",
                     (datetime.utcnow().isoformat(), alert_id),
                 )
-        return True
+                return cursor.rowcount > 0
 
     def resolve_all_for_region(self, region: str) -> int:
         with self._lock:
@@ -132,13 +145,27 @@ class AlertSystem:
                     "UPDATE alerts SET active=0, resolved=? WHERE region=? AND active=1",
                     (datetime.utcnow().isoformat(), region),
                 )
-        return cursor.rowcount
+                return cursor.rowcount
 
     def delete(self, alert_id: int) -> bool:
         with self._lock:
             with self._get_conn() as conn:
-                conn.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
-        return True
+                cursor = conn.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+                return cursor.rowcount > 0
+
+    def set_meta(self, key: str, value: str):
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
 
     def stats(self) -> Dict:
         with self._get_conn() as conn:
